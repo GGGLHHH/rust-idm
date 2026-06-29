@@ -144,7 +144,7 @@ mod pg {
     use super::idm_repo_contract;
     use sqlx::migrate::Migrator;
 
-    /// 编译期内嵌 crates/idm/migrations(相对 idm crate 的 CARGO_MANIFEST_DIR)。
+    /// 编译期内嵌 idm crate 的 migrations/(相对 idm crate 的 CARGO_MANIFEST_DIR)。
     static IDM_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
     /// #[sqlx::test] 的干净临时库:建 idm schema + 跑 idm crate 自带 migrations。

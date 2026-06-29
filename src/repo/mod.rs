@@ -14,7 +14,7 @@ use crate::error::IdmError;
 pub use memory::{InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 pub use postgres::{PgRoleRepo, PgSessionRepo, PgUserRepo};
 
-/// 用户内部实体。`FromRow` 供 PG 查映射;对外 DTO `UserResponse` 由 service 转,审计字段不进 DTO。
+/// 用户内部实体。`FromRow` 供 PG 查映射;读模型 `UserView` 由 service 转,审计字段不进 `UserView`(对外 DTO 归 app)。
 #[derive(Clone, sqlx::FromRow)]
 pub struct User {
     pub id: Uuid,
@@ -84,7 +84,7 @@ pub(crate) enum UserRoles {
     GrantedBy,
 }
 
-/// 用户仓储端口。写操作的 `by` = 审计主体(created_by),来自 `AuditContext`。
+/// 用户仓储端口。写操作的 `by` = 审计主体(created_by),由调用方(app)传入。
 #[async_trait]
 pub trait UserRepo: Send + Sync {
     /// 同事务建 user + user_password(凭据分表)。username 或 email 已被存活用户占用 → `Conflict`(409)。

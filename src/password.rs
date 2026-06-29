@@ -44,7 +44,7 @@ impl PwHasher for Argon2Hasher {
 
 /// 测试实现:前缀标记 + 明文比对,不做真哈希 → 躲开 argon2 的 ~100ms。
 ///
-/// 故意**不**加 `#[cfg(test)]`:集成测试(`tests/`)是独立 crate,需要能从外部构造它注入 `IdmState`。
+/// 故意**不**加 `#[cfg(test)]`:集成测试(`tests/`)是独立 crate,需要能从外部构造它、经 builder 的 `hasher` 端口注入 `AuthService`。
 /// 仅供测试装配使用,生产装配永远注入 `Argon2Hasher`。
 pub struct FakeHasher;
 
