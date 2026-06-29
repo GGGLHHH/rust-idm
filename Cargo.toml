@@ -1,30 +1,22 @@
-# idm —— 自包含的认证服务 crate(领域 + HTTP + 自带 IdmError/audit)。
-# 被 app 当 lib 依赖,也能独立 oneshot 测试 / 分进程部署。迁移表见 migrations/。
+# idm —— 自包含的认证**领域/服务库**(零 HTTP:domain + service + repo + IdmError)。
+# 被 app 当 lib 依赖(app 在自己的 features/auth 建 HTTP 边界);也能独立做 repo 一致性测试。迁移表见 migrations/。
 [package]
 name = "idm"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Self-contained auth / IDM crate for axum: domain + HTTP + its own IdmError, oneshot-testable, embeddable in an app or deployable standalone."
+description = "Self-contained auth / IDM domain & service library: AuthService + pluggable repos + its own IdmError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and cookies."
 license = "MIT"
 repository = "https://github.com/GGGLHHH/rust-idm"
-keywords = ["axum", "auth", "idm", "jwt", "authentication"]
-categories = ["authentication", "web-programming"]
+keywords = ["auth", "idm", "jwt", "authentication", "argon2"]
+categories = ["authentication"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-axum = "0.8"
-axum-extra = { version = "0.10", features = ["cookie"] }
-
-utoipa = { version = "5", features = ["axum_extras", "uuid", "time"] }
-utoipa-axum = "0.2"
-
+# serde:仅 JWT Claims 编解码用(无 HTTP / DTO 序列化)。
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-garde = { version = "0.23", features = ["derive", "email"] }
 
-tracing = "0.1"
 thiserror = "2"
 anyhow = "1"
 
@@ -45,9 +37,6 @@ rand = "0.8"
 [features]
 # 同 app:pg-conformance 开了才编译打真库的仓储一致性测试。
 pg-conformance = []
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
