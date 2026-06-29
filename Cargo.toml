@@ -2,7 +2,7 @@
 # 被 app 当 lib 依赖,也能独立 oneshot 测试 / 分进程部署。迁移表见 migrations/。
 [package]
 name = "idm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained auth / IDM crate for axum: domain + HTTP + its own IdmError, oneshot-testable, embeddable in an app or deployable standalone."
