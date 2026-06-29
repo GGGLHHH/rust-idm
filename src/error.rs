@@ -11,23 +11,23 @@ use utoipa::ToSchema;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdmError {
-    #[error("资源不存在")]
+    #[error("resource not found")]
     NotFound,
 
     /// 业务校验失败(garde)。消息是为用户写的、安全的,可回传给客户端。
-    #[error("请求无效: {0}")]
+    #[error("invalid request: {0}")]
     Validation(String),
 
     /// 请求格式错误(body 非法 JSON 等)→ 400。内含原始提取错误,只进日志、不进响应体。
-    #[error("请求格式错误")]
+    #[error("malformed request")]
     BadRequest(String),
 
     /// 未认证 / 凭据无效 → 401。`client_message` 刻意通用,**绝不区分"用户不存在"与"密码错误"**(防枚举)。
-    #[error("认证失败")]
+    #[error("authentication failed")]
     Unauthorized,
 
     /// 资源冲突(用户名/邮箱已占用)→ 409。消息写给用户、可回传。
-    #[error("资源冲突: {0}")]
+    #[error("conflict: {0}")]
     Conflict(String),
 
     /// 兜底:任何 anyhow 错误(DB/IO/依赖)→ 500。原始 source chain 只进日志。
@@ -62,12 +62,12 @@ impl IdmError {
     /// 进响应 `error` 字段的消息 —— 永远安全、刻意写。Unauthorized 刻意通用(防枚举)。
     pub fn client_message(&self) -> String {
         match self {
-            IdmError::NotFound => "资源不存在".to_owned(),
-            IdmError::Validation(msg) => format!("请求无效: {msg}"),
-            IdmError::BadRequest(_) => "请求格式不正确".to_owned(),
-            IdmError::Unauthorized => "认证失败".to_owned(),
+            IdmError::NotFound => "Resource not found".to_owned(),
+            IdmError::Validation(msg) => format!("Invalid request: {msg}"),
+            IdmError::BadRequest(_) => "Malformed request".to_owned(),
+            IdmError::Unauthorized => "Authentication failed".to_owned(),
             IdmError::Conflict(msg) => msg.clone(),
-            IdmError::Internal(_) => "内部服务器错误".to_owned(),
+            IdmError::Internal(_) => "Internal server error".to_owned(),
         }
     }
 
@@ -97,9 +97,9 @@ impl IntoResponse for IdmError {
         let status = self.status_code();
         if let Some(detail) = self.log_detail() {
             if status.is_server_error() {
-                tracing::error!(code = self.code(), detail, "请求处理失败");
+                tracing::error!(code = self.code(), detail, "request failed");
             } else {
-                tracing::warn!(code = self.code(), detail, "请求被拒绝");
+                tracing::warn!(code = self.code(), detail, "request rejected");
             }
         }
         let body = ErrorBody {

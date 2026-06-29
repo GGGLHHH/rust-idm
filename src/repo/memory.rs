@@ -67,7 +67,9 @@ impl UserRepo for InMemoryUserRepo {
                 && (r.username == username || (email.is_some() && r.email.as_deref() == email))
         });
         if dup {
-            return Err(IdmError::Conflict("用户名或邮箱已被占用".to_owned()));
+            return Err(IdmError::Conflict(
+                "Username or email already taken".to_owned(),
+            ));
         }
         let row = UserRow {
             id: Uuid::now_v7(),
@@ -134,7 +136,9 @@ impl UserRepo for InMemoryUserRepo {
                 && (r.username == username || (email.is_some() && r.email.as_deref() == email))
         });
         if dup {
-            return Err(IdmError::Conflict("用户名或邮箱已被占用".to_owned()));
+            return Err(IdmError::Conflict(
+                "Username or email already taken".to_owned(),
+            ));
         }
         match store.get_mut(&id) {
             Some(r) if r.deleted_at.is_none() => {

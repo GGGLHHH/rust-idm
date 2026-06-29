@@ -87,7 +87,7 @@ impl UserRepo for PgUserRepo {
         let user = sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(usql), uvalues)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| map_unique(e, "用户名或邮箱已被占用"))?;
+            .map_err(|e| map_unique(e, "Username or email already taken"))?;
 
         let (psql, pvalues) = Query::insert()
             .into_table(UserPassword::Table)
@@ -207,7 +207,7 @@ impl UserRepo for PgUserRepo {
         sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| map_unique(e, "用户名或邮箱已被占用"))?
+            .map_err(|e| map_unique(e, "Username or email already taken"))?
             .ok_or(IdmError::NotFound)
     }
 
@@ -414,7 +414,7 @@ impl RoleRepo for PgRoleRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(isql), ivalues)
             .execute(&self.pool)
             .await
-            .map_err(|e| map_unique(e, "角色名已存在"))?;
+            .map_err(|e| map_unique(e, "Role name already exists"))?;
         Ok(id)
     }
 
