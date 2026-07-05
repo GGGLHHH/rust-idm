@@ -21,12 +21,82 @@ pub struct User {
     pub username: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    pub created_at: OffsetDateTime,
 }
 
 /// 用户 + 密码 hash —— **仅** `find_by_email` 返回(登录验密用)。绝不进 DTO / 日志 / 响应。
 pub struct UserWithHash {
     pub user: User,
     pub password_hash: String,
+}
+
+/// admin 用户列表读模型。比 `User` 多 `created_at` + `roles`(角色名),不含审计写字段。
+/// `roles` 映射 PG `text[]`(相关子查询聚合、按名排序);内存实现同样按名排序以保 parity。
+#[derive(Clone, sqlx::FromRow)]
+pub struct UserListRow {
+    pub id: Uuid,
+    pub username: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub created_at: OffsetDateTime,
+    pub roles: Vec<String>,
+}
+
+/// 列表过滤。`None` / 空 `Vec` = 不过滤该维度。
+/// `username` 子串模糊(大小写不敏感);`roles_any` = 角色名有交集;`roles_none` = 无交集;
+/// `created_from`/`created_to` = 闭区间。
+#[derive(Clone, Default)]
+pub struct UserListFilter {
+    pub username: Option<String>,
+    pub roles_any: Vec<String>,
+    pub roles_none: Vec<String>,
+    pub created_from: Option<OffsetDateTime>,
+    pub created_to: Option<OffsetDateTime>,
+}
+
+/// 列表排序键。
+#[derive(Clone, Copy, Debug)]
+pub enum UserSortBy {
+    CreatedAt,
+    Username,
+    Email,
+}
+
+/// 排序方向。
+#[derive(Clone, Copy, Debug)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// 分页模式。`Offset` = 经典页 + 可选总数;`Cursor` = id keyset(v7 全序,默认 created desc 用)。
+#[derive(Clone, Copy, Debug)]
+pub enum ListPage {
+    Offset {
+        offset: u64,
+        limit: u64,
+        with_total: bool,
+    },
+    Cursor {
+        after: Option<Uuid>,
+        limit: u64,
+    },
+}
+
+/// 列表结果。`total` 仅 `Offset { with_total: true }` 时 `Some`;
+/// `next_after` 仅 `Cursor` 且还有下一页时 `Some`(下一页游标)。
+pub struct UserListResult {
+    pub rows: Vec<UserListRow>,
+    pub total: Option<u64>,
+    pub next_after: Option<Uuid>,
+}
+
+/// 角色目录项(`RoleRepo::list` 返回)。
+#[derive(Clone, sqlx::FromRow)]
+pub struct Role {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
 }
 
 /// 会话内部实体。`id` 同时作 JWT 的 `jti`。
@@ -44,6 +114,7 @@ pub(crate) enum Users {
     Username,
     Email,
     EmailVerified,
+    CreatedAt, // 表里已有此列(0001 迁移);list 排序/返回用
     CreatedBy,
     UpdatedBy,
     DeletedAt,
@@ -125,6 +196,28 @@ pub trait UserRepo: Send + Sync {
 
     /// 取存活用户的密码 hash(改密/删号验密用)。
     async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, IdmError>;
+
+    /// admin 列表:过滤(username 模糊 / roles_any / roles_none / created 区间)+ 排序
+    /// (`sort_by`×`dir`,email `NULLS LAST`,id 兜底)+ 分页(offset+可选总数 或 cursor keyset)。
+    /// **只见存活用户**;`roles` 列 = 该用户存活角色名(按名排序)。
+    async fn list(
+        &self,
+        filter: &UserListFilter,
+        sort_by: UserSortBy,
+        dir: SortDir,
+        page: &ListPage,
+    ) -> Result<UserListResult, IdmError>;
+
+    /// 原子建号 + 授角色(**一个事务**:users + user_password + user_roles)。
+    /// username/email 已被存活用户占用 → `Conflict`;任一步失败整体回滚(不留半截)。
+    async fn create_with_roles(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        role_ids: &[Uuid],
+        by: Option<String>,
+    ) -> Result<User, IdmError>;
 }
 
 /// 会话仓储端口。
@@ -170,4 +263,15 @@ pub trait RoleRepo: Send + Sync {
 
     /// 查用户拥有的角色名(存活角色),供 JWT roles claim + 权限判定。
     async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError>;
+
+    /// 角色目录:所有存活角色(按 name 排序)。admin 分配角色的候选集。
+    async fn list(&self) -> Result<Vec<Role>, IdmError>;
+
+    /// **原子全量替换**用户角色集(一个事务:清旧 + 批量授新)。幂等(重复调用结果稳定)。
+    async fn set_roles(
+        &self,
+        user_id: Uuid,
+        role_ids: &[Uuid],
+        by: Option<String>,
+    ) -> Result<(), IdmError>;
 }
