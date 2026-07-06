@@ -7,14 +7,15 @@ use sea_query::{
     Query, SelectStatement,
 };
 use sea_query_sqlx::SqlxBinder;
+use serde_json::{json, Value};
 use sqlx::{AssertSqlSafe, PgPool, Postgres};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ListPage, Role, RoleRepo, Roles, Session, SessionRepo, Sessions, SortDir, User, UserListFilter,
-    UserListResult, UserListRow, UserPassword, UserRepo, UserRoles, UserSortBy, UserWithHash,
-    Users,
+    ListPage, Outbox, OutboxRecord, OutboxRepo, Role, RoleRepo, Roles, Session, SessionRepo,
+    Sessions, SortDir, User, UserListFilter, UserListResult, UserListRow, UserPassword, UserRepo,
+    UserRoles, UserSortBy, UserWithHash, Users,
 };
 use crate::error::IdmError;
 
@@ -67,6 +68,17 @@ fn map_unique(e: sqlx::Error, msg: &str) -> IdmError {
     if let sqlx::Error::Database(db) = &e {
         if db.is_unique_violation() {
             return IdmError::Conflict(msg.to_owned());
+        }
+    }
+    IdmError::Internal(e.into())
+}
+
+/// `user_roles.role_id` 外键冲突(role_id 不存在)→ `NotFound`,镜像内存 `resolve_role_names`
+/// 对非法 role_id 的语义;其它库错误 → `Internal`(原始进日志)。
+fn map_role_fk(e: sqlx::Error) -> IdmError {
+    if let sqlx::Error::Database(db) = &e {
+        if db.is_foreign_key_violation() {
+            return IdmError::NotFound;
         }
     }
     IdmError::Internal(e.into())
@@ -149,6 +161,21 @@ impl UserRepo for PgUserRepo {
             .execute(&mut *tx)
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
+
+        emit_outbox(
+            &mut tx,
+            "user.created",
+            user.id,
+            json!({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+                "roles": Vec::<String>::new(),
+            }),
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -243,6 +270,13 @@ impl UserRepo for PgUserRepo {
         email: Option<&str>,
         by: Option<String>,
     ) -> Result<User, IdmError> {
+        // 事务:UPDATE + emit outbox 同提交(镜像 create/soft_delete)。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+
         // PUT 全量替换:username/email 都 set(email 含清空 null),替换 email 即重置 email_verified。
         let (sql, values) = Query::update()
             .table(Users::Table)
@@ -260,14 +294,39 @@ impl UserRepo for PgUserRepo {
                 Users::CreatedAt,
             ]))
             .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
-            .fetch_optional(&self.pool)
+        let user = sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| map_unique(e, "Username or email already taken"))?
-            .ok_or(IdmError::NotFound)
+            .ok_or(IdmError::NotFound)?;
+
+        emit_outbox(
+            &mut tx,
+            "user.updated",
+            user.id,
+            json!({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "email_verified": user.email_verified,
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(user)
     }
 
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), IdmError> {
+        // 事务:UPDATE + emit outbox 同提交。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+
         let (sql, values) = Query::update()
             .table(Users::Table)
             .value(Users::DeletedAt, OffsetDateTime::now_utc())
@@ -276,12 +335,18 @@ impl UserRepo for PgUserRepo {
             .and_where(Expr::col(Users::DeletedAt).is_null())
             .build_sqlx(PostgresQueryBuilder);
         let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
         if res.rows_affected() == 0 {
             return Err(IdmError::NotFound);
         }
+
+        emit_outbox(&mut tx, "user.deleted", id, json!({ "user_id": id })).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
 
@@ -392,8 +457,24 @@ impl UserRepo for PgUserRepo {
             sqlx::query_with::<Postgres, _>(AssertSqlSafe(rsql), rvalues)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| IdmError::Internal(e.into()))?;
+                .map_err(map_role_fk)?;
         }
+
+        let role_names = resolve_role_names(&mut tx, role_ids).await?;
+        emit_outbox(
+            &mut tx,
+            "user.created",
+            user.id,
+            json!({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+                "roles": role_names,
+            }),
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -755,12 +836,120 @@ impl RoleRepo for PgRoleRepo {
             sqlx::query_with::<Postgres, _>(AssertSqlSafe(isql), ivalues)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| IdmError::Internal(e.into()))?;
+                .map_err(map_role_fk)?;
         }
+
+        let role_names = resolve_role_names(&mut tx, role_ids).await?;
+        emit_outbox(
+            &mut tx,
+            "user.roles_set",
+            user_id,
+            json!({ "user_id": user_id, "roles": role_names }),
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
+}
+
+// ── 发件箱(outbox)──
+
+pub struct PgOutboxRepo {
+    pool: PgPool,
+}
+impl PgOutboxRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl OutboxRepo for PgOutboxRepo {
+    async fn poll_unpublished(&self, limit: i64) -> Result<Vec<OutboxRecord>, IdmError> {
+        // 走部分索引 outbox_unpublished_idx(WHERE published_at IS NULL),按 id 升序 FIFO。
+        let (sql, values) = Query::select()
+            .columns([
+                Outbox::Id,
+                Outbox::EventType,
+                Outbox::AggregateId,
+                Outbox::Payload,
+                Outbox::CreatedAt,
+            ])
+            .from(Outbox::Table)
+            .and_where(Expr::col(Outbox::PublishedAt).is_null())
+            .order_by(Outbox::Id, Order::Asc)
+            .limit(std::cmp::max(limit, 0) as u64)
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<Postgres, OutboxRecord, _>(AssertSqlSafe(sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))
+    }
+
+    async fn mark_published(&self, ids: &[i64]) -> Result<(), IdmError> {
+        if ids.is_empty() {
+            return Ok(()); // 空集省一次 UPDATE(同 find_by_ids 的空集短路)
+        }
+        let (sql, values) = Query::update()
+            .table(Outbox::Table)
+            .value(Outbox::PublishedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(Outbox::Id).is_in(ids.iter().copied()))
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(())
+    }
+}
+
+/// 在给定事务上把 role_ids 解到存活角色名(按名排序,parity 内存侧 sort)——供 `create_with_roles`/
+/// `set_roles` 的 outbox payload 用。非法(不存在的)role_id 在插 `user_roles` 时已被 FK 挡住、
+/// 整个写方法提前 `?` 返回,故走到这里的 role_ids 必定已全部实际存在(可能含已软删角色,不强求"存活")。
+async fn resolve_role_names(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    role_ids: &[Uuid],
+) -> Result<Vec<String>, IdmError> {
+    if role_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 按名排序须 COLLATE "C" 强制字节序,与内存 `.sort()` parity(同 `list()` 的排序理由)。
+    let (sql, values) = Query::select()
+        .column(Roles::Name)
+        .from(Roles::Table)
+        .and_where(Expr::col(Roles::Id).is_in(role_ids.iter().copied()))
+        .and_where(Expr::col(Roles::DeletedAt).is_null())
+        .order_by_expr(Expr::cust(r#""roles"."name" COLLATE "C""#), Order::Asc)
+        .build_sqlx(PostgresQueryBuilder);
+    sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| IdmError::Internal(e.into()))
+}
+
+/// 内部 emit 助手,由各 repo 写方法在其**已有事务**上调用:在给定 `&mut Transaction` 上插一行
+/// outbox,不参与 `PgOutboxRepo` 自己的连接(`PgOutboxRepo` 只 poll/mark,不进写事务)。
+pub(crate) async fn emit_outbox(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    event_type: &str,
+    aggregate_id: Uuid,
+    payload: Value,
+) -> Result<(), IdmError> {
+    let (sql, values) = Query::insert()
+        .into_table(Outbox::Table)
+        .columns([Outbox::EventType, Outbox::AggregateId, Outbox::Payload])
+        .values_panic([
+            event_type.to_owned().into(),
+            aggregate_id.into(),
+            payload.into(),
+        ])
+        .build_sqlx(PostgresQueryBuilder);
+    sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| IdmError::Internal(e.into()))?;
+    Ok(())
 }

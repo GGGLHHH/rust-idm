@@ -25,9 +25,10 @@ pub use identity::AuthUser;
 pub use input::{ChangePasswordInput, LoginInput, RegisterInput, UpdateMeInput};
 pub use password::{Argon2Hasher, FakeHasher, PwHasher};
 pub use repo::{
-    InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, ListPage, PgRoleRepo, PgSessionRepo,
-    PgUserRepo, Role, RoleRepo, Session, SessionRepo, SortDir, User, UserListFilter,
-    UserListResult, UserListRow, UserRepo, UserSortBy, UserWithHash,
+    InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, ListPage,
+    OutboxRecord, OutboxRepo, PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgUserRepo, Role, RoleRepo,
+    Session, SessionRepo, SortDir, User, UserListFilter, UserListResult, UserListRow, UserRepo,
+    UserSortBy, UserWithHash,
 };
 pub use service::{AuthOutcome, AuthService, AuthServiceBuilder, UserView};
 pub use token::{Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier, VerifiedToken};

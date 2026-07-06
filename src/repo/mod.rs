@@ -1,18 +1,20 @@
 //! idm 仓储:`UserRepo`(users + user_password 凭据分表,同事务)、`SessionRepo`(sessions)、
-//! `RoleRepo`(roles + user_roles)。范式同 widget:trait 端口 + 内存/PG 实现分文件,service 依赖 trait。
+//! `RoleRepo`(roles + user_roles)、`OutboxRepo`(outbox,事务性发件箱——写方法内 emit 同事务落一行,
+//! 本端口只管轮询/标记,不管发布机制)。范式同 widget:trait 端口 + 内存/PG 实现分文件,service 依赖 trait。
 
 mod memory;
 mod postgres;
 
 use async_trait::async_trait;
 use sea_query::Iden;
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::IdmError;
 
-pub use memory::{InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
-pub use postgres::{PgRoleRepo, PgSessionRepo, PgUserRepo};
+pub use memory::{InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
+pub use postgres::{PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgUserRepo};
 
 /// 用户内部实体。`FromRow` 供 PG 查映射;读模型 `UserView` 由 service 转,审计字段不进 `UserView`(对外 DTO 归 app)。
 #[derive(Clone, sqlx::FromRow)]
@@ -106,6 +108,16 @@ pub struct Session {
     pub user_id: Uuid,
 }
 
+/// 发件箱记录(`OutboxRepo::poll_unpublished` 返回)。不含 `published_at`——返回的行按定义都未发布。
+#[derive(Clone, sqlx::FromRow)]
+pub struct OutboxRecord {
+    pub id: i64,
+    pub event_type: String,
+    pub aggregate_id: Uuid,
+    pub payload: Value,
+    pub created_at: OffsetDateTime,
+}
+
 // ── sea-query 表/列标识(snake_case:`Users::Table` -> "users"、`EmailVerified` -> "email_verified")──
 #[derive(Iden)]
 pub(crate) enum Users {
@@ -153,6 +165,16 @@ pub(crate) enum UserRoles {
     UserId,
     RoleId,
     GrantedBy,
+}
+#[derive(Iden)]
+pub(crate) enum Outbox {
+    Table,
+    Id,
+    EventType,
+    AggregateId,
+    Payload,
+    CreatedAt,
+    PublishedAt,
 }
 
 /// 用户仓储端口。写操作的 `by` = 审计主体(created_by),由调用方(app)传入。
@@ -274,4 +296,15 @@ pub trait RoleRepo: Send + Sync {
         role_ids: &[Uuid],
         by: Option<String>,
     ) -> Result<(), IdmError>;
+}
+
+/// 发件箱仓储端口(transactional outbox)。只读轮询 + 标记已发布,**不参与写事务**——写事务里的
+/// 那一行由各 repo(`UserRepo`/`RoleRepo`)写方法内部的 emit 助手在自己的 `&mut Transaction` 上插入。
+#[async_trait]
+pub trait OutboxRepo: Send + Sync {
+    /// 取最早的未发布记录(按 id 升序,FIFO),最多 `limit` 条。
+    async fn poll_unpublished(&self, limit: i64) -> Result<Vec<OutboxRecord>, IdmError>;
+
+    /// 标记已发布(盖 published_at)。幂等(重复标记/标记不存在的 id 都 Ok)。
+    async fn mark_published(&self, ids: &[i64]) -> Result<(), IdmError>;
 }

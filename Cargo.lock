@@ -659,7 +659,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -670,6 +670,7 @@ dependencies = [
  "sea-query",
  "sea-query-sqlx",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "thiserror",
@@ -1085,6 +1086,7 @@ checksum = "8d190cfb3bcceb8a8d7d04dee5a0c77f60c7627979cdcb47fdcb8934f009badf"
 dependencies = [
  "itoa",
  "sea-query-derive",
+ "serde_json",
  "time",
  "uuid",
 ]

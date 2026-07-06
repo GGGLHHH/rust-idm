@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ListPage, Role, RoleRepo, Session, SessionRepo, SortDir, User, UserListFilter, UserListResult,
-    UserListRow, UserRepo, UserSortBy, UserWithHash,
+    ListPage, OutboxRecord, OutboxRepo, Role, RoleRepo, Session, SessionRepo, SortDir, User,
+    UserListFilter, UserListResult, UserListRow, UserRepo, UserSortBy, UserWithHash,
 };
 use crate::error::IdmError;
 
@@ -40,6 +41,68 @@ struct RoleRec {
     id: Uuid,
     name: String,
     display_name: String,
+}
+
+/// 把 role_ids 解到存活角色名,供 `user.created`/`user.roles_set` 的 outbox payload 用。
+/// 任一 id 查不到存活角色 → `NotFound`(镜像 PG user_roles→roles 的 FK:非法 role_id 整体失败)。
+fn resolve_role_names(store: &RoleStore, role_ids: &[Uuid]) -> Result<Vec<String>, IdmError> {
+    let roles = store.roles.lock().expect("锁未中毒");
+    role_ids
+        .iter()
+        .map(|rid| {
+            roles
+                .iter()
+                .find(|r| r.id == *rid)
+                .map(|r| r.name.clone())
+                .ok_or(IdmError::NotFound)
+        })
+        .collect()
+}
+
+/// 发件箱内部行:比 `OutboxRecord` 多 `published_at`(是否已发布,对外不暴露——poll 只返未发布行)。
+struct OutboxRow {
+    id: i64,
+    event_type: String,
+    aggregate_id: Uuid,
+    payload: Value,
+    created_at: OffsetDateTime,
+    published_at: Option<OffsetDateTime>,
+}
+
+impl OutboxRow {
+    fn to_record(&self) -> OutboxRecord {
+        OutboxRecord {
+            id: self.id,
+            event_type: self.event_type.clone(),
+            aggregate_id: self.aggregate_id,
+            payload: self.payload.clone(),
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// 发件箱的**共享**存储:内存下 `InMemoryUserRepo`/`InMemoryRoleRepo`(Task 2 起写方法内 emit)与
+/// `InMemoryOutboxRepo`(poll/mark)必须共用同一份 `Vec`,才能镜像 PG "同库不同表读写" 的语义。
+/// 独立 `new()` 各自一份;`sharing_with` 系列共享(同 `RoleStore` 手法)。
+#[derive(Default)]
+struct OutboxStore {
+    rows: Mutex<Vec<OutboxRow>>,
+}
+
+impl OutboxStore {
+    /// 内部 emit 助手,由 `UserRepo`/`RoleRepo` 写方法在自己的锁内调用:追加一行(id 递增,未发布)。
+    fn emit(&self, event_type: &str, aggregate_id: Uuid, payload: Value) {
+        let mut rows = self.rows.lock().expect("锁未中毒");
+        let id = rows.len() as i64 + 1;
+        rows.push(OutboxRow {
+            id,
+            event_type: event_type.to_owned(),
+            aggregate_id,
+            payload,
+            created_at: OffsetDateTime::now_utc(),
+            published_at: None,
+        });
+    }
 }
 
 /// 排序方向套到一个原始 `Ordering` 上。
@@ -85,6 +148,7 @@ impl UserRow {
 pub struct InMemoryUserRepo {
     store: Mutex<HashMap<Uuid, UserRow>>,
     roles: Arc<RoleStore>,
+    outbox: Arc<OutboxStore>,
 }
 
 impl InMemoryUserRepo {
@@ -92,6 +156,7 @@ impl InMemoryUserRepo {
         Self {
             store: Mutex::new(HashMap::new()),
             roles: Arc::new(RoleStore::default()),
+            outbox: Arc::new(OutboxStore::default()),
         }
     }
 }
@@ -133,6 +198,18 @@ impl UserRepo for InMemoryUserRepo {
         };
         let user = row.to_user();
         store.insert(row.id, row);
+        self.outbox.emit(
+            "user.created",
+            user.id,
+            json!({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+                "roles": Vec::<String>::new(),
+            }),
+        );
         Ok(user)
     }
 
@@ -198,7 +275,18 @@ impl UserRepo for InMemoryUserRepo {
                 r.username = username.to_owned();
                 r.email = email.map(str::to_owned);
                 r.email_verified = false;
-                Ok(r.to_user())
+                let user = r.to_user();
+                self.outbox.emit(
+                    "user.updated",
+                    user.id,
+                    json!({
+                        "user_id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                        "email_verified": user.email_verified,
+                    }),
+                );
+                Ok(user)
             }
             _ => Err(IdmError::NotFound),
         }
@@ -209,6 +297,8 @@ impl UserRepo for InMemoryUserRepo {
         match store.get_mut(&id) {
             Some(r) if r.deleted_at.is_none() => {
                 r.deleted_at = Some(OffsetDateTime::now_utc());
+                self.outbox
+                    .emit("user.deleted", id, json!({ "user_id": id }));
                 Ok(())
             }
             _ => Err(IdmError::NotFound),
@@ -255,6 +345,10 @@ impl UserRepo for InMemoryUserRepo {
                 "Username or email already taken".to_owned(),
             ));
         }
+        // 先校验:role_ids 必须都是存活角色,否则不动任何存储(镜像 PG user_roles 对 roles 的 FK)。
+        let mut role_names = resolve_role_names(&self.roles, role_ids)?;
+        role_names.sort();
+
         let id = Uuid::now_v7();
         let row = UserRow {
             id,
@@ -275,6 +369,19 @@ impl UserRepo for InMemoryUserRepo {
                 grants.push((id, *rid));
             }
         }
+        drop(grants);
+        self.outbox.emit(
+            "user.created",
+            user.id,
+            json!({
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+                "roles": role_names,
+            }),
+        );
         Ok(user)
     }
 
@@ -469,12 +576,14 @@ impl SessionRepo for InMemorySessionRepo {
 /// 从而 `create_with_roles` / `set_roles` 写的授予对 `roles_for_user` / `list` 可见(镜像 PG 共表)。
 pub struct InMemoryRoleRepo {
     inner: Arc<RoleStore>,
+    outbox: Arc<OutboxStore>,
 }
 
 impl InMemoryRoleRepo {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RoleStore::default()),
+            outbox: Arc::new(OutboxStore::default()),
         }
     }
 
@@ -482,6 +591,7 @@ impl InMemoryRoleRepo {
     pub fn sharing_with(users: &InMemoryUserRepo) -> Self {
         Self {
             inner: Arc::clone(&users.roles),
+            outbox: Arc::clone(&users.outbox),
         }
     }
 }
@@ -559,6 +669,10 @@ impl RoleRepo for InMemoryRoleRepo {
         role_ids: &[Uuid],
         _by: Option<String>,
     ) -> Result<(), IdmError> {
+        // 先校验:role_ids 必须都是存活角色,否则不动 grants(镜像 PG FK)。
+        let mut role_names = resolve_role_names(&self.inner, role_ids)?;
+        role_names.sort();
+
         // 全量替换:清该 user 的所有授予,再批量加新(去重)。幂等。
         let mut grants = self.inner.grants.lock().expect("锁未中毒");
         grants.retain(|(u, _)| *u != user_id);
@@ -567,6 +681,109 @@ impl RoleRepo for InMemoryRoleRepo {
                 grants.push((user_id, *rid));
             }
         }
+        drop(grants);
+
+        self.outbox.emit(
+            "user.roles_set",
+            user_id,
+            json!({ "user_id": user_id, "roles": role_names }),
+        );
         Ok(())
+    }
+}
+
+/// 发件箱内存实现:与 `InMemoryUserRepo`/`InMemoryRoleRepo` 可共享同一份 `OutboxStore`
+/// (见 [`InMemoryOutboxRepo::sharing_with`]),让 Task 2 起 emit 的行经本 repo 的 poll/mark 可见
+/// (镜像 PG "同库不同表" 的语义)。
+pub struct InMemoryOutboxRepo {
+    inner: Arc<OutboxStore>,
+}
+
+impl InMemoryOutboxRepo {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(OutboxStore::default()),
+        }
+    }
+
+    /// 与给定 `InMemoryUserRepo` **共享**发件箱存储。
+    pub fn sharing_with(users: &InMemoryUserRepo) -> Self {
+        Self {
+            inner: Arc::clone(&users.outbox),
+        }
+    }
+}
+
+impl Default for InMemoryOutboxRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl OutboxRepo for InMemoryOutboxRepo {
+    async fn poll_unpublished(&self, limit: i64) -> Result<Vec<OutboxRecord>, IdmError> {
+        let rows = self.inner.rows.lock().expect("锁未中毒");
+        // 插入序即 id 升序(Vec 只追加),故直接按序取前 limit 条 = ORDER BY id ASC LIMIT。
+        Ok(rows
+            .iter()
+            .filter(|r| r.published_at.is_none())
+            .take(limit.max(0) as usize)
+            .map(OutboxRow::to_record)
+            .collect())
+    }
+
+    async fn mark_published(&self, ids: &[i64]) -> Result<(), IdmError> {
+        let mut rows = self.inner.rows.lock().expect("锁未中毒");
+        let now = OffsetDateTime::now_utc();
+        for r in rows.iter_mut() {
+            if ids.contains(&r.id) {
+                r.published_at.get_or_insert(now);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// emit → poll 见到(FIFO,按 emit 序)→ mark 第一条 → poll 只剩第二条 → mark 完 → poll 空。
+    #[tokio::test]
+    async fn outbox_emit_poll_mark_roundtrip() {
+        let outbox = InMemoryOutboxRepo::new();
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        outbox.inner.emit("user.created", a, json!({"who": "a"}));
+        outbox.inner.emit("user.created", b, json!({"who": "b"}));
+
+        let rows = outbox.poll_unpublished(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].aggregate_id, a);
+        assert_eq!(rows[1].aggregate_id, b);
+
+        outbox.mark_published(&[rows[0].id]).await.unwrap();
+        let remaining = outbox.poll_unpublished(10).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].aggregate_id, b);
+
+        outbox.mark_published(&[remaining[0].id]).await.unwrap();
+        assert!(outbox.poll_unpublished(10).await.unwrap().is_empty());
+    }
+
+    /// `InMemoryOutboxRepo::sharing_with` / `InMemoryRoleRepo::sharing_with` 与 `InMemoryUserRepo`
+    /// 共享同一个 `Arc<OutboxStore>`(Task 2 的前提:任一侧 emit,三个 repo 视角一致)。
+    #[tokio::test]
+    async fn outbox_shares_store_with_user_and_role_repo() {
+        let users = InMemoryUserRepo::new();
+        let roles = InMemoryRoleRepo::sharing_with(&users);
+        let outbox = InMemoryOutboxRepo::sharing_with(&users);
+        assert!(Arc::ptr_eq(&users.outbox, &roles.outbox));
+        assert!(Arc::ptr_eq(&users.outbox, &outbox.inner));
+
+        users.outbox.emit("user.created", Uuid::now_v7(), json!({}));
+        assert_eq!(outbox.poll_unpublished(10).await.unwrap().len(), 1);
     }
 }

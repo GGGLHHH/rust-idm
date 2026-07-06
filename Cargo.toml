@@ -2,7 +2,7 @@
 # 被 app 当 lib 依赖(app 在自己的 features/auth 建 HTTP 边界);也能独立做 repo 一致性测试。迁移表见 migrations/。
 [package]
 name = "idm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained auth / IDM domain & service library: AuthService + pluggable repos + its own IdmError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and cookies."
@@ -14,15 +14,17 @@ categories = ["authentication"]
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# serde:仅 JWT Claims 编解码用(无 HTTP / DTO 序列化)。
+# serde:JWT Claims 编解码 + outbox payload(serde_json::Value)用(无 HTTP / DTO 序列化)。
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 thiserror = "2"
 anyhow = "1"
 
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "time", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "time", "migrate", "json"] }
 sea-query = "1.0"
-sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time"] }
+# with-json:outbox.payload 是 jsonb 列(serde_json::Value)。
+sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time", "with-json"] }
 async-trait = "0.1"
 
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

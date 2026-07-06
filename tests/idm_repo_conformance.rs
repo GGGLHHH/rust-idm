@@ -6,7 +6,9 @@
 //! PG 入口:`just test-pg-idm`(需 DATABASE_URL 连 idm role + 跑着的 pg)。
 
 use idm::IdmError;
-use idm::{ListPage, RoleRepo, SessionRepo, SortDir, UserListFilter, UserRepo, UserSortBy};
+use idm::{
+    ListPage, OutboxRepo, RoleRepo, SessionRepo, SortDir, UserListFilter, UserRepo, UserSortBy,
+};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -412,6 +414,116 @@ async fn idm_user_admin_contract(users: &dyn UserRepo, roles: &dyn RoleRepo) {
     let _ = bob;
 }
 
+/// outbox 事件契约(Task 2):每个写方法在自己的事务/锁内 emit 一条领域事件,payload 形状正确,
+/// 失败路径(唯一冲突 / 非法 role_id)不留残留行。内存(三件套共享存储)与 PG(天然共表)各跑一遍。
+async fn idm_outbox_contract(users: &dyn UserRepo, roles: &dyn RoleRepo, outbox: &dyn OutboxRepo) {
+    assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+
+    let editor = roles.upsert("editor", "Editor", None).await.unwrap();
+    let viewer = roles.upsert("viewer", "Viewer", None).await.unwrap();
+
+    // ── create_with_roles → 恰一条 user.created,payload 含正确角色名 ──
+    let dana = users
+        .create_with_roles("dana", Some("dana@x.io"), "h", &[editor], None)
+        .await
+        .unwrap();
+    let rows = outbox.poll_unpublished(100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_type, "user.created");
+    assert_eq!(rows[0].aggregate_id, dana.id);
+    let p = &rows[0].payload;
+    assert_eq!(p["user_id"], serde_json::to_value(dana.id).unwrap());
+    assert_eq!(p["username"], "dana");
+    assert_eq!(p["email"], "dana@x.io");
+    assert_eq!(p["email_verified"], false);
+    assert_eq!(
+        p["created_at"],
+        serde_json::to_value(dana.created_at).unwrap()
+    );
+    assert_eq!(p["roles"], serde_json::json!(["editor"]));
+    outbox.mark_published(&[rows[0].id]).await.unwrap();
+
+    // ── create(无角色)→ user.created,roles = [] ──
+    let erin = users.create("erin", None, "h", None).await.unwrap();
+    let rows = outbox.poll_unpublished(100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_type, "user.created");
+    assert_eq!(rows[0].aggregate_id, erin.id);
+    assert_eq!(rows[0].payload["roles"], serde_json::json!([]));
+    assert_eq!(rows[0].payload["email"], serde_json::Value::Null);
+    outbox.mark_published(&[rows[0].id]).await.unwrap();
+
+    // ── update → 恰一条 user.updated ──
+    users
+        .update(dana.id, "dana2", Some("dana2@x.io"), None)
+        .await
+        .unwrap();
+    let rows = outbox.poll_unpublished(100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_type, "user.updated");
+    assert_eq!(rows[0].aggregate_id, dana.id);
+    assert_eq!(rows[0].payload["username"], "dana2");
+    assert_eq!(rows[0].payload["email"], "dana2@x.io");
+    assert_eq!(rows[0].payload["email_verified"], false);
+    outbox.mark_published(&[rows[0].id]).await.unwrap();
+
+    // ── update_password → 不 emit ──
+    users.update_password(dana.id, "h2").await.unwrap();
+    assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+
+    // ── set_roles → 恰一条 user.roles_set,roles = 替换后的结果 ──
+    roles.set_roles(dana.id, &[viewer], None).await.unwrap();
+    let rows = outbox.poll_unpublished(100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_type, "user.roles_set");
+    assert_eq!(rows[0].aggregate_id, dana.id);
+    assert_eq!(rows[0].payload["roles"], serde_json::json!(["viewer"]));
+    outbox.mark_published(&[rows[0].id]).await.unwrap();
+
+    // ── soft_delete → 恰一条 user.deleted ──
+    users.soft_delete(dana.id, None).await.unwrap();
+    let rows = outbox.poll_unpublished(100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_type, "user.deleted");
+    assert_eq!(rows[0].aggregate_id, dana.id);
+    assert_eq!(
+        rows[0].payload["user_id"],
+        serde_json::to_value(dana.id).unwrap()
+    );
+    outbox.mark_published(&[rows[0].id]).await.unwrap();
+
+    // ── 回滚:重名 create_with_roles 失败 → 无残留 ──
+    assert!(users
+        .create_with_roles("erin", None, "h", &[], None)
+        .await
+        .is_err());
+    assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+
+    // ── 回滚:非法 role_id 的 create_with_roles 失败 → 无残留,且两后端同一 NotFound 变体 ──
+    let bogus_role = Uuid::now_v7();
+    let err = users
+        .create_with_roles("frank", None, "h", &[bogus_role], None)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, IdmError::NotFound),
+        "invalid role_id must be NotFound, got {err:?}"
+    );
+    assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+
+    // ── 回滚:非法 role_id 的 set_roles 失败 → 无残留,且两后端同一 NotFound 变体 ──
+    let err = roles
+        .set_roles(erin.id, &[bogus_role], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, IdmError::NotFound),
+        "invalid role_id must be NotFound, got {err:?}"
+    );
+    assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+}
+
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
 #[tokio::test]
 async fn memory_satisfies_idm_contract() {
@@ -433,12 +545,23 @@ async fn memory_satisfies_user_admin_contract() {
     idm_user_admin_contract(&users, &roles).await;
 }
 
+// ── 入口 1c:内存 outbox 契约(users↔roles↔outbox 三件套共享存储)──
+#[tokio::test]
+async fn memory_satisfies_outbox_contract() {
+    use idm::{InMemoryOutboxRepo, InMemoryRoleRepo, InMemoryUserRepo};
+    let users = InMemoryUserRepo::new();
+    let roles = InMemoryRoleRepo::sharing_with(&users);
+    let outbox = InMemoryOutboxRepo::sharing_with(&users);
+    idm_outbox_contract(&users, &roles, &outbox).await;
+}
+
 // ── 入口 2:PG(需 --features pg-conformance + DATABASE_URL 连 idm role + 跑着的 pg)──
 // bootstrap 内联在本文件(不走 #[path] include):sqlx::migrate! 在被 include 的文件里会按
 // "相对当前文件目录"解析路径(sqlx 不支持),内联后它相对 idm crate 的 CARGO_MANIFEST_DIR、稳。
 #[cfg(feature = "pg-conformance")]
 mod pg {
     use super::idm_repo_contract;
+    use idm::OutboxRepo;
     use sqlx::migrate::Migrator;
 
     /// 编译期内嵌 idm crate 的 migrations/(相对 idm crate 的 CARGO_MANIFEST_DIR)。
@@ -473,6 +596,65 @@ mod pg {
         let users = idm::PgUserRepo::new(pool.clone());
         let roles = idm::PgRoleRepo::new(pool);
         super::idm_user_admin_contract(&users, &roles).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pg_satisfies_outbox_contract(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        bootstrap_idm(&pool)
+            .await
+            .expect("bootstrap idm schema + 跑 migrations");
+        let users = idm::PgUserRepo::new(pool.clone());
+        let roles = idm::PgRoleRepo::new(pool.clone());
+        let outbox = idm::PgOutboxRepo::new(pool);
+        super::idm_outbox_contract(&users, &roles, &outbox).await;
+        Ok(())
+    }
+
+    /// outbox:emit 助手是 `pub(crate)`,本文件是外部集成测试够不着,改直插 SQL 模拟 Task 2 写路径
+    /// 落地的效果 → poll_unpublished 见到(FIFO,按 id 升序)→ mark 第一条 → 只剩第二条 → mark 完 → 空。
+    #[sqlx::test(migrations = false)]
+    async fn pg_outbox_poll_and_mark(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        use serde_json::json;
+
+        bootstrap_idm(&pool)
+            .await
+            .expect("bootstrap idm schema + 跑 migrations");
+
+        for who in ["a", "b"] {
+            sqlx::query(
+                "insert into outbox (event_type, aggregate_id, payload) values ($1, $2, $3)",
+            )
+            .bind("user.created")
+            .bind(super::Uuid::now_v7())
+            .bind(json!({ "who": who }))
+            .execute(&pool)
+            .await?;
+        }
+
+        let outbox = idm::PgOutboxRepo::new(pool.clone());
+        let rows = outbox.poll_unpublished(10).await.expect("poll");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].payload["who"], "a"); // FIFO:id 升序
+        assert_eq!(rows[1].payload["who"], "b");
+
+        outbox
+            .mark_published(&[rows[0].id])
+            .await
+            .expect("mark first");
+        let remaining = outbox.poll_unpublished(10).await.expect("poll again");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload["who"], "b");
+
+        outbox
+            .mark_published(&[remaining[0].id])
+            .await
+            .expect("mark second");
+        assert!(outbox
+            .poll_unpublished(10)
+            .await
+            .expect("poll empty")
+            .is_empty());
         Ok(())
     }
 }
