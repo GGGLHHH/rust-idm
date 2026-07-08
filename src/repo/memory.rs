@@ -743,6 +743,16 @@ impl OutboxRepo for InMemoryOutboxRepo {
         }
         Ok(())
     }
+
+    async fn emit(
+        &self,
+        event_type: &str,
+        aggregate_id: Uuid,
+        payload: serde_json::Value,
+    ) -> Result<(), IdmError> {
+        self.inner.emit(event_type, aggregate_id, payload);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +781,22 @@ mod tests {
 
         outbox.mark_published(&[remaining[0].id]).await.unwrap();
         assert!(outbox.poll_unpublished(10).await.unwrap().is_empty());
+    }
+
+    /// 公共 `OutboxRepo::emit`(auth 事件用):emit → poll 立即可见,FIFO 保序。
+    #[tokio::test]
+    async fn public_emit_appends_pollable_row() {
+        let outbox = InMemoryOutboxRepo::new();
+        let agg = Uuid::now_v7();
+        outbox
+            .emit("auth.login_succeeded", agg, json!({"user_id": agg}))
+            .await
+            .unwrap();
+
+        let rows = outbox.poll_unpublished(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "auth.login_succeeded");
+        assert_eq!(rows[0].aggregate_id, agg);
     }
 
     /// `InMemoryOutboxRepo::sharing_with` / `InMemoryRoleRepo::sharing_with` 与 `InMemoryUserRepo`

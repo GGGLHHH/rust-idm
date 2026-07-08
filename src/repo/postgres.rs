@@ -904,6 +904,29 @@ impl OutboxRepo for PgOutboxRepo {
             .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
+
+    async fn emit(
+        &self,
+        event_type: &str,
+        aggregate_id: Uuid,
+        payload: Value,
+    ) -> Result<(), IdmError> {
+        // 与内部 `emit_outbox` 同一插入形状,但走本 repo 自己的连接池(非事务、单条)。
+        let (sql, values) = Query::insert()
+            .into_table(Outbox::Table)
+            .columns([Outbox::EventType, Outbox::AggregateId, Outbox::Payload])
+            .values_panic([
+                event_type.to_owned().into(),
+                aggregate_id.into(),
+                payload.into(),
+            ])
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(())
+    }
 }
 
 /// 在给定事务上把 role_ids 解到存活角色名(按名排序,parity 内存侧 sort)——供 `create_with_roles`/

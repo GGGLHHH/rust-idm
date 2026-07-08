@@ -307,4 +307,14 @@ pub trait OutboxRepo: Send + Sync {
 
     /// 标记已发布(盖 published_at)。幂等(重复标记/标记不存在的 id 都 Ok)。
     async fn mark_published(&self, ids: &[i64]) -> Result<(), IdmError>;
+
+    /// **非事务** emit(auth 审计事件用):不挂任何 domain 写事务,单条 insert 到 outbox。
+    /// 与 `emit_outbox` 助手(挂调用方 `&mut Transaction`)互补 —— 后者给"领域写 + 事件同事务"的场景,
+    /// 本方法给"无领域写的纯审计事件"(登录成功/失败/登出…),由消费方(app handler)在 HTTP 边界调用。
+    async fn emit(
+        &self,
+        event_type: &str,
+        aggregate_id: Uuid,
+        payload: serde_json::Value,
+    ) -> Result<(), IdmError>;
 }

@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use super::clock::{Clock, SystemClock};
 use super::input::{ChangePasswordInput, LoginInput, RegisterInput, UpdateMeInput};
-use super::repo::{RoleRepo, SessionRepo, User, UserRepo};
+use super::repo::{RoleRepo, Session, SessionRepo, User, UserRepo};
 use super::token::{self, Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier};
 use super::{Argon2Hasher, PwHasher};
-use crate::error::IdmError;
+use crate::error::{CredentialFailure, IdmError};
 use crate::identity::AuthUser;
 
 /// 用户读模型(域投影):`User` 实体 + 角色名。`me`/`update_me`/`AuthOutcome.user` 的返回。
@@ -28,8 +28,11 @@ pub struct UserView {
 
 /// 认证结果(**纯数据**):用户视图 + 待写进 cookie 的 token + cookie max-age(秒)。
 /// app 把 token 写进 httponly `Set-Cookie`、body 返 `user`;token 不进响应体。
+/// **刻意不派生 `Debug`**:持 access/refresh token 明文,Debug 会把密钥打进日志/panic 输出。
 pub struct AuthOutcome {
     pub user: UserView,
+    /// 本次登录/注册/刷新所建会话的 id(= `sessions.id` = JWT `jti`)。审计/设备管理用。
+    pub session_id: Uuid,
     pub access_token: String,
     pub refresh_token: String,
     pub access_max_age_secs: i64,
@@ -119,17 +122,17 @@ impl AuthService {
     }
 
     /// 登录:查用户(identifier=username 或 email)→ 验密 → 发会话。
-    /// **防枚举**:不存在与密码错均返回同一 `Unauthorized`。
+    /// 失败原因**仅供审计**(`CredentialFailure`);HTTP 401 收口由消费方 app 统一(防枚举)。
     pub async fn login(&self, input: LoginInput) -> Result<AuthOutcome, IdmError> {
         let identifier = normalize(&input.identifier);
         let Some(found) = self.inner.users.find_by_identifier(&identifier).await? else {
-            return Err(IdmError::Unauthorized);
+            return Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser));
         };
         if !self
             .verify_password(input.password, found.password_hash)
             .await?
         {
-            return Err(IdmError::Unauthorized);
+            return Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword));
         }
         self.issue_session(&found.user, None).await
     }
@@ -164,8 +167,8 @@ impl AuthService {
         self.issue_session(&user, None).await
     }
 
-    /// 登出:撤销该 refresh 对应的会话。幂等(找不到也 Ok)。
-    pub async fn logout(&self, refresh_token: &str) -> Result<(), IdmError> {
+    /// 登出:撤销该 refresh 对应的会话,返回被撤会话(含 `user_id`,审计用)。幂等(找不到活跃会话 → `None`)。
+    pub async fn logout(&self, refresh_token: &str) -> Result<Option<Session>, IdmError> {
         let hash = token::hash_refresh(refresh_token);
         if let Some(session) = self
             .inner
@@ -174,8 +177,9 @@ impl AuthService {
             .await?
         {
             self.inner.sessions.revoke(session.id).await?;
+            return Ok(Some(session));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// 登出所有设备:撤销用户全部活跃会话。
@@ -271,6 +275,7 @@ impl AuthService {
         let access = self.inner.signer.sign(&claims)?;
         Ok(AuthOutcome {
             user: to_view(user, roles),
+            session_id: session.id,
             access_token: access,
             refresh_token: refresh,
             access_max_age_secs: self.inner.access_ttl_secs,
@@ -466,5 +471,84 @@ mod tests {
             ),
             "时钟越过 refresh_ttl 后会话应过期 → 401"
         );
+    }
+
+    #[tokio::test]
+    async fn login_reports_distinct_failure_reasons() {
+        use crate::error::CredentialFailure;
+        use crate::input::LoginInput;
+
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .build();
+        svc.register(register_input("alice"), None).await.unwrap();
+
+        // 未知用户。用 matches! 匹配整个 Result(纯模式匹配,不需 AuthOutcome: Debug —
+        // 该类型持 token 明文,故意不派生 Debug;不能用 .unwrap_err() 逼它派生)。
+        let unknown = svc
+            .login(LoginInput { identifier: "ghost".into(), password: "password123".into() })
+            .await;
+        assert!(
+            matches!(unknown, Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser))),
+            "查无此人应为 UnknownUser"
+        );
+
+        // 密码错(alice 存在,密码非 password123)
+        let bad = svc
+            .login(LoginInput { identifier: "alice".into(), password: "wrong".into() })
+            .await;
+        assert!(
+            matches!(bad, Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))),
+            "密码不匹配应为 BadPassword"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_outcome_exposes_rotating_session_id() {
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .build();
+
+        let reg = svc.register(register_input("alice"), None).await.unwrap();
+        assert!(!reg.session_id.is_nil(), "注册应带非空 session_id");
+
+        // 刷新轮换 → 新会话,session_id 必不同。
+        let refreshed = svc.refresh(&reg.refresh_token).await.unwrap();
+        assert_ne!(
+            reg.session_id, refreshed.session_id,
+            "refresh 轮换后应是新的 session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_returns_revoked_session_id_then_none() {
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .build();
+
+        let reg = svc.register(register_input("alice"), None).await.unwrap();
+        let revoked = svc.logout(&reg.refresh_token).await.unwrap();
+        assert!(
+            matches!(revoked, Some(ref session) if session.id == reg.session_id),
+            "登出应返回被撤会话,且 id 匹配"
+        );
+
+        // 幂等:同一 token 再登出 → 无活跃会话 → None。
+        assert!(svc.logout(&reg.refresh_token).await.unwrap().is_none());
     }
 }

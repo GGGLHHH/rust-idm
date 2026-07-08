@@ -20,7 +20,7 @@ mod service;
 mod token;
 
 pub use clock::{Clock, SystemClock};
-pub use error::IdmError;
+pub use error::{CredentialFailure, IdmError};
 pub use identity::AuthUser;
 pub use input::{ChangePasswordInput, LoginInput, RegisterInput, UpdateMeInput};
 pub use password::{Argon2Hasher, FakeHasher, PwHasher};
