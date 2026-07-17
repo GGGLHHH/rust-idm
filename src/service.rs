@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::clock::{Clock, SystemClock};
 use super::input::{ChangePasswordInput, LoginInput, RegisterInput, UpdateMeInput};
 use super::repo::{RoleRepo, Session, SessionRepo, User, UserRepo};
-use super::token::{self, Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier};
+use super::token::{self, ClaimsExtender, Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier};
 use super::{Argon2Hasher, PwHasher};
 use crate::error::{CredentialFailure, IdmError};
 use crate::identity::AuthUser;
@@ -52,6 +52,7 @@ struct Inner {
     hasher: Arc<dyn PwHasher>,
     signer: Arc<dyn TokenSigner>,
     verifier: Arc<dyn TokenVerifier>,
+    claims_extender: Option<Arc<dyn ClaimsExtender>>,
     clock: Arc<dyn Clock>,
     access_ttl_secs: i64,
     refresh_ttl_secs: i64,
@@ -98,6 +99,7 @@ impl AuthService {
             hasher: Arc::new(Argon2Hasher),
             signer: None,
             verifier: None,
+            claims_extender: None,
             clock: Arc::new(SystemClock),
             access_ttl_secs: DEFAULT_ACCESS_TTL_SECS,
             refresh_ttl_secs: DEFAULT_REFRESH_TTL_SECS,
@@ -152,6 +154,26 @@ impl AuthService {
         let user = self.inner.users.find_by_id(user_id).await?;
         let roles = self.inner.roles.roles_for_user(user_id).await?;
         Ok(to_view(&user, roles))
+    }
+
+    /// 这枚 refresh token 属于谁 —— **只读、零副作用**。无效/过期/已撤销 → `None`。
+    ///
+    /// 存在的理由:`refresh` 与 `logout` 都同时做「认人」和「改状态」,所以想在**动状态之前**
+    /// 核对「这枚 refresh 与那枚 access 是不是同一个人」的调用方无从下手 —— 只能先改再问,
+    /// 而那时已经晚了。典型场景:一个 handler 同时收 access token(可能来自 `Authorization:
+    /// Bearer`)与 refresh cookie,两者**不保证同源**;不交叉核对就会拿 A 的身份改状态、
+    /// 再按 B 的 cookie 发新会话,并把这笔账记在 B 头上。
+    ///
+    /// 它**不是**认证入口:别拿它当「验 refresh token」用(那是 `refresh` 的活,含轮换)。
+    pub async fn session_owner(&self, refresh_token: &str) -> Result<Option<Uuid>, IdmError> {
+        let hash = token::hash_refresh(refresh_token);
+        let now = self.inner.clock.now();
+        Ok(self
+            .inner
+            .sessions
+            .find_active(&hash, now)
+            .await?
+            .map(|s| s.user_id))
     }
 
     /// 刷新:验 refresh hash → 轮换(撤旧 session、发新会话)。无效/过期/已撤销 → `Unauthorized`。
@@ -255,6 +277,12 @@ impl AuthService {
     ) -> Result<AuthOutcome, IdmError> {
         let now = self.inner.clock.now();
         let roles = self.inner.roles.roles_for_user(user.id).await?;
+        // 与上一行对称:roles 是 idm 认得的身份事实,extra 是 idm 只负责运输的 app 事实。
+        // 没装端口 = Null(行为同 v0.5.0)。Err 让整条铸币失败 —— 见 ClaimsExtender 的 doc。
+        let extra = match &self.inner.claims_extender {
+            Some(e) => e.extra_for(user.id).await?,
+            None => serde_json::Value::Null,
+        };
         let (refresh, refresh_hash) = token::generate_refresh();
         let refresh_expires_at = now + Duration::seconds(self.inner.refresh_ttl_secs);
         let session = self
@@ -269,6 +297,7 @@ impl AuthService {
             email: user.email.clone(),
             email_verified: user.email_verified,
             roles: roles.clone(),
+            extra,
             issued_at: now,
             expires_at: now + Duration::seconds(self.inner.access_ttl_secs),
         };
@@ -308,6 +337,7 @@ pub struct AuthServiceBuilder {
     hasher: Arc<dyn PwHasher>,
     signer: Option<Arc<dyn TokenSigner>>,
     verifier: Option<Arc<dyn TokenVerifier>>,
+    claims_extender: Option<Arc<dyn ClaimsExtender>>,
     clock: Arc<dyn Clock>,
     access_ttl_secs: i64,
     refresh_ttl_secs: i64,
@@ -331,6 +361,16 @@ impl AuthServiceBuilder {
     /// 自定义验证端口(只验不签 —— app 侧最小权限,持公钥)。
     pub fn verifier(mut self, verifier: Arc<dyn TokenVerifier>) -> Self {
         self.verifier = Some(verifier);
+        self
+    }
+
+    /// **自定义 claims 端口**(可选):铸币时问一次「这个人还有什么该进 claim」,
+    /// 结果原样落进 `TokenClaims::extra` 交给 signer。不装 = `extra` 恒 `Null`。
+    ///
+    /// 装它,而不是把自定义事实编码进 `roles` —— roles 是角色闭集,混入别的东西会
+    /// 污染按角色判定的授权闸。见 [`ClaimsExtender`]。
+    pub fn claims_extender(mut self, extender: Arc<dyn ClaimsExtender>) -> Self {
+        self.claims_extender = Some(extender);
         self
     }
 
@@ -374,6 +414,7 @@ impl AuthServiceBuilder {
                 hasher: self.hasher,
                 signer,
                 verifier,
+                claims_extender: self.claims_extender,
                 clock: self.clock,
                 access_ttl_secs: self.access_ttl_secs,
                 refresh_ttl_secs: self.refresh_ttl_secs,
@@ -473,6 +514,147 @@ mod tests {
         );
     }
 
+    /// 记录被问了谁 + 返回固定 extra 的探针端口。
+    struct SpyExtender(Mutex<Vec<uuid::Uuid>>);
+    #[async_trait::async_trait]
+    impl crate::token::ClaimsExtender for SpyExtender {
+        async fn extra_for(&self, user_id: uuid::Uuid) -> Result<serde_json::Value, IdmError> {
+            self.0.lock().unwrap().push(user_id);
+            Ok(serde_json::json!({ "tenant": "acme" }))
+        }
+    }
+
+    /// 解出 JWT 中段的 payload。**故意读线上字节而不是走 `verify`** —— `VerifiedToken`
+    /// 按设计不回读自定义 claims,所以能证明 extra 真进了 token 的只有 token 本身。
+    fn payload_of(token: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let mid = token.split('.').nth(1).expect("JWT 应有三段");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(mid).unwrap()).unwrap()
+    }
+
+    /// `ClaimsExtender` 的输出必须出现在**每一条**铸币路径签出的 token 里:
+    /// register / login / refresh。
+    ///
+    /// 这是这个端口存在的唯一理由。漏掉任何一条,app 拿到的就是一枚**少了授权输入**
+    /// 的 token(如 tenant_id) —— 而那是静默降权或静默越权:没有异常、没有日志、
+    /// 没有任何东西会报错,只有用户看见了不该看见的数据。所以三条路径逐一钉死。
+    #[tokio::test]
+    async fn claims_extender_output_reaches_every_minting_path() {
+        use crate::input::LoginInput;
+
+        let spy = Arc::new(SpyExtender(Mutex::new(Vec::new())));
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .claims_extender(spy.clone())
+        .build();
+
+        // ① register
+        let reg = svc.register(register_input("alice"), None).await.unwrap();
+        assert_eq!(
+            payload_of(&reg.access_token)["extra"]["tenant"],
+            "acme",
+            "register 签出的 token 少了 extra"
+        );
+
+        // ② login
+        let login = svc
+            .login(LoginInput {
+                identifier: "alice".into(),
+                password: "password123".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            payload_of(&login.access_token)["extra"]["tenant"],
+            "acme",
+            "login 签出的 token 少了 extra"
+        );
+
+        // ③ refresh —— 切租户就走这条,漏了它 = 切了等于没切
+        let refreshed = svc.refresh(&login.refresh_token).await.unwrap();
+        assert_eq!(
+            payload_of(&refreshed.access_token)["extra"]["tenant"],
+            "acme",
+            "refresh 签出的 token 少了 extra"
+        );
+
+        // 每条路径都按 user_id 问过一次,且问的是同一个人。
+        let calls = spy.0.lock().unwrap();
+        assert_eq!(calls.len(), 3, "三条铸币路径各该问一次 extender");
+        assert!(
+            calls.iter().all(|id| *id == reg.user.id),
+            "extender 被问的 user_id 与实际签发对象不符"
+        );
+    }
+
+    /// `session_owner` **只读**:问完之后 refresh 仍然可用(没被轮换掉)。
+    /// 这是它存在的全部意义 —— 调用方要在**动状态之前**核对身份,而 `refresh`/`logout`
+    /// 都会先把状态改了。
+    #[tokio::test]
+    async fn session_owner_identifies_without_side_effects() {
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .build();
+
+        let a = svc.register(register_input("alice"), None).await.unwrap();
+        let b = svc.register(register_input("bob"), None).await.unwrap();
+
+        assert_eq!(
+            svc.session_owner(&a.refresh_token).await.unwrap(),
+            Some(a.user.id),
+            "该认出 refresh 的主人"
+        );
+        assert_ne!(
+            svc.session_owner(&b.refresh_token).await.unwrap(),
+            Some(a.user.id),
+            "别人的 refresh 绝不能认成 alice"
+        );
+        assert_eq!(
+            svc.session_owner("garbage").await.unwrap(),
+            None,
+            "无效 token → None,不是报错"
+        );
+
+        // **零副作用**:问过之后,同一枚 refresh 仍然能刷 —— 若 session_owner 顺手轮换了,
+        // 调用方就没法「先核对再动手」了(那正是它要解决的问题)。
+        assert!(
+            svc.refresh(&a.refresh_token).await.is_ok(),
+            "session_owner 不得消耗/轮换 refresh"
+        );
+    }
+
+    /// 不装 extender = 行为与 v0.5.0 完全一致:token 里**没有** extra 这个键
+    /// (不是 `"extra":null`)。老 app 升级到本版无需改一行。
+    #[tokio::test]
+    async fn without_extender_tokens_are_unchanged() {
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .build();
+
+        let reg = svc.register(register_input("alice"), None).await.unwrap();
+        let payload = payload_of(&reg.access_token);
+        assert!(
+            payload.get("extra").is_none(),
+            "没装 extender 时 token 不该多出 extra 键,实际:{payload}"
+        );
+    }
+
     #[tokio::test]
     async fn login_reports_distinct_failure_reasons() {
         use crate::error::CredentialFailure;
@@ -491,19 +673,31 @@ mod tests {
         // 未知用户。用 matches! 匹配整个 Result(纯模式匹配,不需 AuthOutcome: Debug —
         // 该类型持 token 明文,故意不派生 Debug;不能用 .unwrap_err() 逼它派生)。
         let unknown = svc
-            .login(LoginInput { identifier: "ghost".into(), password: "password123".into() })
+            .login(LoginInput {
+                identifier: "ghost".into(),
+                password: "password123".into(),
+            })
             .await;
         assert!(
-            matches!(unknown, Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser))),
+            matches!(
+                unknown,
+                Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser))
+            ),
             "查无此人应为 UnknownUser"
         );
 
         // 密码错(alice 存在,密码非 password123)
         let bad = svc
-            .login(LoginInput { identifier: "alice".into(), password: "wrong".into() })
+            .login(LoginInput {
+                identifier: "alice".into(),
+                password: "wrong".into(),
+            })
             .await;
         assert!(
-            matches!(bad, Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))),
+            matches!(
+                bad,
+                Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))
+            ),
             "密码不匹配应为 BadPassword"
         );
     }
