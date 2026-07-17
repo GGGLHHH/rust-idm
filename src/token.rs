@@ -24,6 +24,17 @@ pub struct TokenClaims {
     pub email: Option<String>,
     pub email_verified: bool,
     pub roles: Vec<String>,
+    /// **app 注入的自定义 claims**(tenant_id / 权限位 / 功能开关…),由
+    /// [`ClaimsExtender`] 在铸币时填;没装端口 = `Value::Null`。
+    ///
+    /// idm **不解释**它的内容,只负责原样运到 signer 手里 —— 形状归 app,
+    /// 因为只有 app 知道自己要放什么。
+    ///
+    /// **为什么必须有这个字段**:`TokenSigner::sign` 是同步的,拿不到 `&self` 之外的
+    /// 任何东西,更不能 await 一次查库。没有它,app 想往 claim 里塞任何身份之外的
+    /// 事实,唯一的缝隙就是把它编码进 `roles: Vec<String>` —— 一个字符串走私通道,
+    /// 会污染角色闭集、绕过所有按角色判定的授权闸。本字段就是那条缝的正门。
+    pub extra: serde_json::Value,
     pub issued_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }
@@ -33,6 +44,21 @@ pub struct VerifiedToken {
     pub user_id: Uuid,
     pub username: String,
     pub roles: Vec<String>,
+}
+
+/// **自定义 claims 端口**(app 注入,可选):铸币时问一次「这个人还有什么该进 claim」。
+///
+/// 位置与 [`RoleRepo::roles_for_user`](crate::RoleRepo::roles_for_user) **对称** —— 同在
+/// `issue_session` 里、同按 user_id 问、同在每条铸币路径(register / login / refresh)上跑一次。
+/// 区别只是:roles 是 idm 认得的身份事实,extra 是 idm 不认得、只负责运输的 app 事实。
+///
+/// 不装 = `TokenClaims::extra` 恒 `Null`,行为与 v0.5.0 完全一致。
+#[async_trait::async_trait]
+pub trait ClaimsExtender: Send + Sync {
+    /// 返回该用户这一刻的自定义 claims。**Err 会让整条铸币失败** —— 这是有意的:
+    /// 自定义 claim 常是授权输入(如 tenant_id),读不到就签一枚「没有它」的 token
+    /// 等于静默降权/越权,宁可让登录炸。不想炸就在实现里自己兜底成 `Null`。
+    async fn extra_for(&self, user_id: Uuid) -> Result<serde_json::Value, IdmError>;
 }
 
 /// 签发端口(idm 进程):把身份事实签成 access token。实现决定 claim 形状 + 算法 + 密钥源。
@@ -71,6 +97,11 @@ struct Hs256Claims {
     email_verified: bool,
     #[serde(default)]
     roles: Vec<String>,
+    /// app 的自定义 claims 原样落进 token。**装了 `ClaimsExtender` 却在这儿丢掉,
+    /// 等于 extender 白装且无人知晓** —— 所以便捷实现也必须运它。`Null` 时不出现在
+    /// token 里(skip_serializing_if),旧 token 无此键也能解(default)。
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    extra: serde_json::Value,
     iat: i64,
     exp: i64,
 }
@@ -84,6 +115,7 @@ impl TokenSigner for Hs256Tokens {
             email: c.email.clone(),
             email_verified: c.email_verified,
             roles: c.roles.clone(),
+            extra: c.extra.clone(),
             iat: c.issued_at.unix_timestamp(),
             exp: c.expires_at.unix_timestamp(),
         };
@@ -139,6 +171,7 @@ mod tests {
             email: None,
             email_verified: false,
             roles: vec!["admin".into()],
+            extra: serde_json::Value::Null,
             issued_at: OffsetDateTime::now_utc(),
             expires_at,
         }

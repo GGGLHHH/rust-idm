@@ -31,4 +31,6 @@ pub use repo::{
     UserSortBy, UserWithHash,
 };
 pub use service::{AuthOutcome, AuthService, AuthServiceBuilder, UserView};
-pub use token::{Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier, VerifiedToken};
+pub use token::{
+    ClaimsExtender, Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier, VerifiedToken,
+};
