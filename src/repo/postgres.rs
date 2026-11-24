@@ -108,6 +108,7 @@ struct UserHashRow {
 
 #[async_trait]
 impl UserRepo for PgUserRepo {
+    #[tracing::instrument(name = "pg.users.create", skip_all)]
     async fn create(
         &self,
         username: &str,
@@ -183,6 +184,7 @@ impl UserRepo for PgUserRepo {
         Ok(user)
     }
 
+    #[tracing::instrument(name = "pg.users.find_by_identifier", skip_all)]
     async fn find_by_identifier(&self, identifier: &str) -> Result<Option<UserWithHash>, IdmError> {
         // WHERE (username = $ OR email = $) AND deleted_at IS NULL
         let (sql, values) = Query::select()
@@ -221,6 +223,7 @@ impl UserRepo for PgUserRepo {
         }))
     }
 
+    #[tracing::instrument(name = "pg.users.find_by_id", skip_all)]
     async fn find_by_id(&self, id: Uuid) -> Result<User, IdmError> {
         let (sql, values) = Query::select()
             .columns([
@@ -241,6 +244,7 @@ impl UserRepo for PgUserRepo {
             .ok_or(IdmError::NotFound)
     }
 
+    #[tracing::instrument(name = "pg.users.find_by_ids", skip_all)]
     async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, IdmError> {
         if ids.is_empty() {
             return Ok(Vec::new()); // 空集省一次查询,也避开空 IN ()
@@ -263,6 +267,7 @@ impl UserRepo for PgUserRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.users.update", skip_all)]
     async fn update(
         &self,
         id: Uuid,
@@ -319,6 +324,7 @@ impl UserRepo for PgUserRepo {
         Ok(user)
     }
 
+    #[tracing::instrument(name = "pg.users.soft_delete", skip_all)]
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), IdmError> {
         // 事务:UPDATE + emit outbox 同提交。
         let mut tx = self
@@ -350,6 +356,7 @@ impl UserRepo for PgUserRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.users.update_password", skip_all)]
     async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), IdmError> {
         let (sql, values) = Query::update()
             .table(UserPassword::Table)
@@ -364,6 +371,7 @@ impl UserRepo for PgUserRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.users.password_hash", skip_all)]
     async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, IdmError> {
         // 仅存活用户:join users 过滤 deleted_at
         let (sql, values) = Query::select()
@@ -383,6 +391,7 @@ impl UserRepo for PgUserRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.users.create_with_roles", skip_all)]
     async fn create_with_roles(
         &self,
         username: &str,
@@ -482,6 +491,7 @@ impl UserRepo for PgUserRepo {
         Ok(user)
     }
 
+    #[tracing::instrument(name = "pg.users.list", skip_all)]
     async fn list(
         &self,
         filter: &UserListFilter,
@@ -597,6 +607,7 @@ impl PgSessionRepo {
 
 #[async_trait]
 impl SessionRepo for PgSessionRepo {
+    #[tracing::instrument(name = "pg.sessions.create", skip_all)]
     async fn create(
         &self,
         user_id: Uuid,
@@ -631,6 +642,7 @@ impl SessionRepo for PgSessionRepo {
         Ok(Session { id, user_id })
     }
 
+    #[tracing::instrument(name = "pg.sessions.find_active", skip_all)]
     async fn find_active(
         &self,
         token_hash: &str,
@@ -649,6 +661,7 @@ impl SessionRepo for PgSessionRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.sessions.revoke", skip_all)]
     async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError> {
         let (sql, values) = Query::update()
             .table(Sessions::Table)
@@ -663,6 +676,7 @@ impl SessionRepo for PgSessionRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.sessions.revoke_all", skip_all)]
     async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError> {
         let mut q = Query::update();
         q.table(Sessions::Table)
@@ -694,6 +708,7 @@ impl PgRoleRepo {
 
 #[async_trait]
 impl RoleRepo for PgRoleRepo {
+    #[tracing::instrument(name = "pg.roles.upsert", skip_all)]
     async fn upsert(
         &self,
         name: &str,
@@ -739,6 +754,7 @@ impl RoleRepo for PgRoleRepo {
         Ok(id)
     }
 
+    #[tracing::instrument(name = "pg.roles.grant", skip_all)]
     async fn grant(
         &self,
         user_id: Uuid,
@@ -762,6 +778,7 @@ impl RoleRepo for PgRoleRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.roles.roles_for_user", skip_all)]
     async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         // SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id
         //   WHERE ur.user_id = $ AND r.deleted_at IS NULL
@@ -781,6 +798,7 @@ impl RoleRepo for PgRoleRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.roles.list", skip_all)]
     async fn list(&self) -> Result<Vec<Role>, IdmError> {
         // SELECT id, name, display_name FROM roles WHERE deleted_at IS NULL ORDER BY name
         let (sql, values) = Query::select()
@@ -795,6 +813,7 @@ impl RoleRepo for PgRoleRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.roles.set_roles", skip_all)]
     async fn set_roles(
         &self,
         user_id: Uuid,
@@ -889,6 +908,7 @@ impl OutboxRepo for PgOutboxRepo {
             .map_err(|e| IdmError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.outbox.mark_published", skip_all)]
     async fn mark_published(&self, ids: &[i64]) -> Result<(), IdmError> {
         if ids.is_empty() {
             return Ok(()); // 空集省一次 UPDATE(同 find_by_ids 的空集短路)
@@ -905,6 +925,7 @@ impl OutboxRepo for PgOutboxRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.outbox.emit", skip_all)]
     async fn emit(
         &self,
         event_type: &str,
