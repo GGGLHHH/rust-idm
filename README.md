@@ -47,9 +47,12 @@ let who = auth.authenticate_token(&access_token)?;           // -> AuthUser { id
 ## Testing
 
 ```sh
-cargo test                                 # unit tests (no DB)
-cargo test --features pg-conformance        # + memory↔Postgres repo parity (needs a running pg)
+just test       # unit tests + in-memory repo conformance (no DB)
+just test-pg    # + memory↔Postgres repo parity (needs a running pg; DATABASE_URL → idm role)
+just lint       # rustfmt check + clippy -D warnings (same as CI)
 ```
+
+Tooling, lint config and conventions mirror baserust — see `AGENTS.md`.
 
 ## License
 

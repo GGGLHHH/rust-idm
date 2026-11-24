@@ -3,7 +3,7 @@
 //! "内存绿不保证 PG 绿"的漂移,全靠这套契约抓。
 //!
 //! 内存入口:默认 `cargo test` 就跑(零 DB)。
-//! PG 入口:`just test-pg-idm`(需 DATABASE_URL 连 idm role + 跑着的 pg)。
+//! PG 入口:`just test-pg`(需 DATABASE_URL 连 idm role + 跑着的 pg)。
 
 use idm::IdmError;
 use idm::{
