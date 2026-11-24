@@ -491,19 +491,31 @@ mod tests {
         // 未知用户。用 matches! 匹配整个 Result(纯模式匹配,不需 AuthOutcome: Debug —
         // 该类型持 token 明文,故意不派生 Debug;不能用 .unwrap_err() 逼它派生)。
         let unknown = svc
-            .login(LoginInput { identifier: "ghost".into(), password: "password123".into() })
+            .login(LoginInput {
+                identifier: "ghost".into(),
+                password: "password123".into(),
+            })
             .await;
         assert!(
-            matches!(unknown, Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser))),
+            matches!(
+                unknown,
+                Err(IdmError::InvalidCredentials(CredentialFailure::UnknownUser))
+            ),
             "查无此人应为 UnknownUser"
         );
 
         // 密码错(alice 存在,密码非 password123)
         let bad = svc
-            .login(LoginInput { identifier: "alice".into(), password: "wrong".into() })
+            .login(LoginInput {
+                identifier: "alice".into(),
+                password: "wrong".into(),
+            })
             .await;
         assert!(
-            matches!(bad, Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))),
+            matches!(
+                bad,
+                Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))
+            ),
             "密码不匹配应为 BadPassword"
         );
     }
