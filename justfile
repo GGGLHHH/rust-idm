@@ -5,7 +5,7 @@ set dotenv-load := true
 
 # PG conformance 连 idm role(search_path=idm 由 role 配置继承)。默认指向 baserust 本地 compose 的 pg;
 # 第一次跑前在 baserust 里 `just pg-test-grant`(给 idm 授 CREATEDB,#[sqlx::test] 要建临时库)。
-pg_url := env_var_or_default("DATABASE_URL", "postgres://idm:" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + env_var_or_default("PG_HOST", "localhost") + ":" + env_var_or_default("PG_PORT", "5821") + "/" + env_var_or_default("POSTGRES_DB", "baserust") + "?sslmode=disable")
+pg_url := env_var_or_default("DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + env_var_or_default("PG_HOST", "localhost") + ":" + env_var_or_default("PG_PORT", "5821") + "/" + env_var_or_default("POSTGRES_DB", "baserust") + "?sslmode=disable")
 
 # 编译/clippy 实时反馈面板(面板内按 c/l/t 切 check/clippy/test)
 watch:
