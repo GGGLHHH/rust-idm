@@ -3,7 +3,7 @@
 //! 暴露:`AuthService`(编排注册/登录/会话轮换/改密)、可拔插仓储端口(内存/PG)、哈希端口
 //! (`PwHasher`)、**token 签验端口**(`TokenSigner`/`TokenVerifier`,默认 `Hs256Tokens` —— claim 形状
 //! 与签名算法/密钥可拔插、分进程可只验不签)、**时间端口**(`Clock`/`SystemClock`,测试可注入固定时钟)、
-//! 领域类型(`User`/`AuthUser`/`UserView`)、纯数据契约(`AuthOutcome`)、领域错误 `IdmError`。
+//! 领域类型(`User`/`AuthUser`/`UserView`/多租户的 `Tenant`/`Membership`/`RoleScope`)、纯数据契约(`AuthOutcome`)、领域错误 `IdmError`。
 //! **不含任何 HTTP**:路由、DTO、校验、cookie、状态码全归消费方(app)—— app 在自己的
 //! `features/auth/` 建端点、做校验、写 httponly cookie,并 `From<IdmError> for AppError` 接错误。
 //!
@@ -17,6 +17,7 @@ mod input;
 pub mod password;
 mod repo;
 mod service;
+mod tenant;
 mod token;
 
 pub use clock::{Clock, SystemClock};
@@ -25,10 +26,16 @@ pub use identity::AuthUser;
 pub use input::{ChangePasswordInput, LoginInput, RegisterInput, UpdateMeInput};
 pub use password::{Argon2Hasher, FakeHasher, PwHasher};
 pub use repo::{
-    InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, ListPage,
-    OutboxRecord, OutboxRepo, PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgUserRepo, Role, RoleRepo,
-    Session, SessionRepo, SortDir, User, UserListFilter, UserListResult, UserListRow, UserRepo,
-    UserSortBy, UserWithHash,
+    InMemoryMemberRepo, InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo,
+    InMemoryTenantRepo, InMemoryUserRepo, ListPage, ListResult, MemberRepo, OutboxRecord,
+    OutboxRepo, PgMemberRepo, PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgTenantRepo, PgUserRepo,
+    Role, RoleRepo, Session, SessionRepo, SortDir, TenantRepo, User, UserListFilter,
+    UserListResult, UserListRow, UserRepo, UserSortBy, UserWithHash,
 };
-pub use service::{AuthOutcome, AuthService, AuthServiceBuilder, UserView};
+pub use service::{
+    AuthOutcome, AuthService, AuthServiceBuilder, LoginCandidates, LoginEntry, UserView,
+};
+pub use tenant::{
+    MemberStatus, Membership, RoleScope, Tenant, TenantStatus, UnknownValue, DEFAULT_TENANT_ID,
+};
 pub use token::{Hs256Tokens, TokenClaims, TokenSigner, TokenVerifier, VerifiedToken};

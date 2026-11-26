@@ -30,6 +30,10 @@ pub enum IdmError {
     #[error("invalid credentials")]
     InvalidCredentials(CredentialFailure),
 
+    /// 已认证但无权做这件事(如切换到自己不是有效成员的租户)。消费方映射成 403。
+    #[error("forbidden")]
+    Forbidden,
+
     /// 资源冲突(用户名/邮箱已占用)。消息写给用户、可回传。
     #[error("conflict: {0}")]
     Conflict(String),

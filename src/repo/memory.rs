@@ -11,10 +11,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ListPage, OutboxRecord, OutboxRepo, Role, RoleRepo, Session, SessionRepo, SortDir, User,
-    UserListFilter, UserListResult, UserListRow, UserRepo, UserSortBy, UserWithHash,
+    ListPage, ListResult, MemberRepo, OutboxRecord, OutboxRepo, Role, RoleRepo, Session,
+    SessionRepo, SortDir, TenantRepo, User, UserListFilter, UserListResult, UserListRow, UserRepo,
+    UserSortBy, UserWithHash,
 };
 use crate::error::IdmError;
+use crate::tenant::{MemberStatus, Membership, RoleScope, Tenant, TenantStatus, DEFAULT_TENANT_ID};
 
 /// 内存内部行:比 `User` 多 password_hash + created_at + deleted_at(DTO 不暴露)。
 #[derive(Clone)]
@@ -41,6 +43,7 @@ struct RoleRec {
     id: Uuid,
     name: String,
     display_name: String,
+    scope: RoleScope,
 }
 
 /// 把 role_ids 解到存活角色名,供 `user.created`/`user.roles_set` 的 outbox payload 用。
@@ -57,6 +60,29 @@ fn resolve_role_names(store: &RoleStore, role_ids: &[Uuid]) -> Result<Vec<String
                 .ok_or(IdmError::NotFound)
         })
         .collect()
+}
+
+/// role_ids 里**租户角色**的名字(按名排序)——`Membership.roles` 与成员事件 payload 共用。
+fn tenant_role_names(store: &RoleStore, role_ids: &[Uuid]) -> Vec<String> {
+    let roles = store.roles.lock().expect("锁未中毒");
+    let mut names: Vec<String> = roles
+        .iter()
+        .filter(|r| r.scope == RoleScope::Tenant && role_ids.contains(&r.id))
+        .map(|r| r.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// 去重保序(镜像 PG 主键冲突跳过)。
+fn dedup_ids(role_ids: &[Uuid]) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = Vec::new();
+    for rid in role_ids {
+        if !ids.contains(rid) {
+            ids.push(*rid);
+        }
+    }
+    ids
 }
 
 /// 发件箱内部行:比 `OutboxRecord` 多 `published_at`(是否已发布,对外不暴露——poll 只返未发布行)。
@@ -145,18 +171,55 @@ impl UserRow {
     }
 }
 
+/// 建号三处(create / create_with_roles / create_with_membership)共用:查重 → `precheck` → 写用户行。
+/// 唯一性只看存活行(镜像 username / email 两个 partial unique 索引)。`precheck` 在查重**之后**、写入**之前**跑
+/// (镜像 PG 先撞唯一索引、再撞后续外键的错误优先级),失败则不写;其返回值原样带回给调用方。
+fn insert_user_row<R>(
+    store: &mut HashMap<Uuid, UserRow>,
+    username: &str,
+    email: Option<&str>,
+    password_hash: &str,
+    precheck: impl FnOnce() -> Result<R, IdmError>,
+) -> Result<(User, R), IdmError> {
+    let dup = store.values().any(|r| {
+        r.deleted_at.is_none()
+            && (r.username == username || (email.is_some() && r.email.as_deref() == email))
+    });
+    if dup {
+        return Err(IdmError::Conflict(
+            "Username or email already taken".to_owned(),
+        ));
+    }
+    let extra = precheck()?;
+    let row = UserRow {
+        id: Uuid::now_v7(),
+        username: username.to_owned(),
+        email: email.map(str::to_owned),
+        email_verified: false,
+        password_hash: password_hash.to_owned(),
+        created_at: OffsetDateTime::now_utc(),
+        deleted_at: None,
+    };
+    let user = row.to_user();
+    store.insert(row.id, row);
+    Ok((user, extra))
+}
+
 pub struct InMemoryUserRepo {
-    store: Mutex<HashMap<Uuid, UserRow>>,
+    /// `Arc`:成员仓储共享它,镜像 PG `tenant_members.user_id → users` 的 FK(查用户是否存在)。
+    store: Arc<Mutex<HashMap<Uuid, UserRow>>>,
     roles: Arc<RoleStore>,
     outbox: Arc<OutboxStore>,
+    tenants: Arc<TenantStore>,
 }
 
 impl InMemoryUserRepo {
     pub fn new() -> Self {
         Self {
-            store: Mutex::new(HashMap::new()),
+            store: Arc::new(Mutex::new(HashMap::new())),
             roles: Arc::new(RoleStore::default()),
             outbox: Arc::new(OutboxStore::default()),
+            tenants: Arc::new(TenantStore::default()),
         }
     }
 }
@@ -177,38 +240,12 @@ impl UserRepo for InMemoryUserRepo {
         _by: Option<String>,
     ) -> Result<User, IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
-        // username 唯一 + email(有则)唯一,仅对存活行:镜像两个 partial unique 索引。
-        let dup = store.values().any(|r| {
-            r.deleted_at.is_none()
-                && (r.username == username || (email.is_some() && r.email.as_deref() == email))
-        });
-        if dup {
-            return Err(IdmError::Conflict(
-                "Username or email already taken".to_owned(),
-            ));
-        }
-        let row = UserRow {
-            id: Uuid::now_v7(),
-            username: username.to_owned(),
-            email: email.map(str::to_owned),
-            email_verified: false,
-            password_hash: password_hash.to_owned(),
-            created_at: OffsetDateTime::now_utc(),
-            deleted_at: None,
-        };
-        let user = row.to_user();
-        store.insert(row.id, row);
+        let (user, ()) = insert_user_row(&mut store, username, email, password_hash, || Ok(()))?;
+        drop(store);
         self.outbox.emit(
             "user.created",
             user.id,
-            json!({
-                "user_id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "email_verified": user.email_verified,
-                "created_at": user.created_at,
-                "roles": Vec::<String>::new(),
-            }),
+            super::user_created_payload(&user, &[]),
         );
         Ok(user)
     }
@@ -335,53 +372,80 @@ impl UserRepo for InMemoryUserRepo {
         _by: Option<String>,
     ) -> Result<User, IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
-        // 同 create:username / email(有则)唯一,仅对存活行。
-        let dup = store.values().any(|r| {
-            r.deleted_at.is_none()
-                && (r.username == username || (email.is_some() && r.email.as_deref() == email))
-        });
-        if dup {
-            return Err(IdmError::Conflict(
-                "Username or email already taken".to_owned(),
-            ));
-        }
-        // 先校验:role_ids 必须都是存活角色,否则不动任何存储(镜像 PG user_roles 对 roles 的 FK)。
-        let mut role_names = resolve_role_names(&self.roles, role_ids)?;
-        role_names.sort();
-
-        let id = Uuid::now_v7();
-        let row = UserRow {
-            id,
-            username: username.to_owned(),
-            email: email.map(str::to_owned),
-            email_verified: false,
-            password_hash: password_hash.to_owned(),
-            created_at: OffsetDateTime::now_utc(),
-            deleted_at: None,
-        };
-        let user = row.to_user();
-        store.insert(id, row);
+        // 查重之后、写入之前校验 role_ids 都是存活角色(镜像 PG user_roles 对 roles 的 FK),否则不动任何存储。
+        let (user, mut role_names) =
+            insert_user_row(&mut store, username, email, password_hash, || {
+                resolve_role_names(&self.roles, role_ids)
+            })?;
         drop(store);
+        role_names.sort();
         // 授角色:写共享 user_roles(去重),parity with PG on_conflict do nothing。
         let mut grants = self.roles.grants.lock().expect("锁未中毒");
         for rid in role_ids {
-            if !grants.contains(&(id, *rid)) {
-                grants.push((id, *rid));
+            if !grants.contains(&(user.id, *rid)) {
+                grants.push((user.id, *rid));
             }
         }
         drop(grants);
         self.outbox.emit(
             "user.created",
             user.id,
-            json!({
-                "user_id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "email_verified": user.email_verified,
-                "created_at": user.created_at,
-                "roles": role_names,
-            }),
+            super::user_created_payload(&user, &role_names),
         );
+        Ok(user)
+    }
+
+    async fn create_with_membership(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        tenant_id: Uuid,
+        role_ids: &[Uuid],
+        _by: Option<String>,
+    ) -> Result<User, IdmError> {
+        let mut store = self.store.lock().expect("锁未中毒");
+        // 查重之后、写入之前:校验角色(FK)+ 取可加入的租户快照(存活且 active;否则只建账号)。
+        let (user, tenant) = insert_user_row(&mut store, username, email, password_hash, || {
+            resolve_role_names(&self.roles, role_ids)?;
+            Ok(self
+                .tenants
+                .tenants
+                .lock()
+                .expect("锁未中毒")
+                .iter()
+                .find(|t| {
+                    t.id == tenant_id && t.deleted_at.is_none() && t.status == TenantStatus::Active
+                })
+                .map(|t| t.id))
+        })?;
+        drop(store);
+        self.outbox.emit(
+            "user.created",
+            user.id,
+            super::user_created_payload(&user, &[]),
+        );
+
+        if let Some(tid) = tenant {
+            let ids = dedup_ids(role_ids);
+            let names = tenant_role_names(&self.roles, &ids);
+            self.tenants
+                .members
+                .lock()
+                .expect("锁未中毒")
+                .push(MemberRec {
+                    tenant_id: tid,
+                    user_id: user.id,
+                    status: MemberStatus::Active,
+                    last_used_at: None,
+                    role_ids: ids,
+                });
+            self.outbox.emit(
+                "tenant.member_added",
+                tid,
+                super::member_payload(tid, user.id, Some(MemberStatus::Active), Some(&names)),
+            );
+        }
         Ok(user)
     }
 
@@ -488,6 +552,7 @@ impl UserRepo for InMemoryUserRepo {
 struct SessionRow {
     id: Uuid,
     user_id: Uuid,
+    tenant_id: Option<Uuid>,
     token_hash: String,
     expires_at: OffsetDateTime,
     revoked_at: Option<OffsetDateTime>,
@@ -495,12 +560,24 @@ struct SessionRow {
 
 pub struct InMemorySessionRepo {
     store: Mutex<Vec<SessionRow>>,
+    /// 租户存储(镜像 PG `sessions.tenant_id → tenants` 的外键:建会话时校验租户存在)。
+    tenants: Arc<TenantStore>,
 }
 
 impl InMemorySessionRepo {
+    /// 独立一份租户存储(只有默认租户)。要和别的内存仓储看同一批租户 → [`Self::sharing_with`]。
     pub fn new() -> Self {
         Self {
             store: Mutex::new(Vec::new()),
+            tenants: Arc::new(TenantStore::default()),
+        }
+    }
+
+    /// 与给定 `InMemoryUserRepo` **共享**租户存储(镜像 PG 外键看的是同一张 tenants 表)。
+    pub fn sharing_with(users: &InMemoryUserRepo) -> Self {
+        Self {
+            store: Mutex::new(Vec::new()),
+            tenants: Arc::clone(&users.tenants),
         }
     }
 }
@@ -516,13 +593,28 @@ impl SessionRepo for InMemorySessionRepo {
     async fn create(
         &self,
         user_id: Uuid,
+        tenant_id: Option<Uuid>,
         token_hash: &str,
         expires_at: OffsetDateTime,
         _by: Option<String>,
     ) -> Result<Session, IdmError> {
+        // 镜像 PG 外键:租户行须存在(已软删的行也还在,外键不拦)。
+        if let Some(t) = tenant_id {
+            let exists = self
+                .tenants
+                .tenants
+                .lock()
+                .expect("锁未中毒")
+                .iter()
+                .any(|x| x.id == t);
+            if !exists {
+                return Err(IdmError::NotFound);
+            }
+        }
         let row = SessionRow {
             id: Uuid::now_v7(),
             user_id,
+            tenant_id,
             token_hash: token_hash.to_owned(),
             expires_at,
             revoked_at: None,
@@ -530,6 +622,7 @@ impl SessionRepo for InMemorySessionRepo {
         let session = Session {
             id: row.id,
             user_id,
+            tenant_id,
         };
         self.store.lock().expect("锁未中毒").push(row);
         Ok(session)
@@ -549,6 +642,7 @@ impl SessionRepo for InMemorySessionRepo {
             .map(|r| Session {
                 id: r.id,
                 user_id: r.user_id,
+                tenant_id: r.tenant_id,
             }))
     }
 
@@ -569,6 +663,28 @@ impl SessionRepo for InMemorySessionRepo {
             }
         }
         Ok(())
+    }
+
+    async fn revoke_for_member(&self, tenant_id: Uuid, user_id: Uuid) -> Result<(), IdmError> {
+        self.revoke_where(|r| r.tenant_id == Some(tenant_id) && r.user_id == user_id);
+        Ok(())
+    }
+
+    async fn revoke_for_tenant(&self, tenant_id: Uuid) -> Result<(), IdmError> {
+        self.revoke_where(|r| r.tenant_id == Some(tenant_id));
+        Ok(())
+    }
+}
+
+impl InMemorySessionRepo {
+    /// 给满足条件的活跃会话盖 revoked_at(已撤销的不动,幂等)。
+    fn revoke_where(&self, pred: impl Fn(&SessionRow) -> bool) {
+        let now = OffsetDateTime::now_utc();
+        for r in self.store.lock().expect("锁未中毒").iter_mut() {
+            if r.revoked_at.is_none() && pred(r) {
+                r.revoked_at = Some(now);
+            }
+        }
     }
 }
 
@@ -608,10 +724,12 @@ impl RoleRepo for InMemoryRoleRepo {
         &self,
         name: &str,
         display_name: &str,
+        scope: RoleScope,
         _by: Option<String>,
     ) -> Result<Uuid, IdmError> {
         let mut roles = self.inner.roles.lock().expect("锁未中毒");
-        if let Some(r) = roles.iter().find(|r| r.name == name) {
+        if let Some(r) = roles.iter_mut().find(|r| r.name == name) {
+            r.scope = scope; // 以调用方的代码闭集为准校正 scope
             return Ok(r.id);
         }
         let id = Uuid::now_v7();
@@ -619,6 +737,7 @@ impl RoleRepo for InMemoryRoleRepo {
             id,
             name: name.to_owned(),
             display_name: display_name.to_owned(),
+            scope,
         });
         Ok(id)
     }
@@ -639,10 +758,16 @@ impl RoleRepo for InMemoryRoleRepo {
     async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         let grants = self.inner.grants.lock().expect("锁未中毒");
         let roles = self.inner.roles.lock().expect("锁未中毒");
+        // 只回平台角色(镜像 PG 的 scope = 'platform' 过滤)
         Ok(grants
             .iter()
             .filter(|(u, _)| *u == user_id)
-            .filter_map(|(_, rid)| roles.iter().find(|r| r.id == *rid).map(|r| r.name.clone()))
+            .filter_map(|(_, rid)| {
+                roles
+                    .iter()
+                    .find(|r| r.id == *rid && r.scope == RoleScope::Platform)
+                    .map(|r| r.name.clone())
+            })
             .collect())
     }
 
@@ -657,6 +782,7 @@ impl RoleRepo for InMemoryRoleRepo {
                 id: r.id,
                 name: r.name.clone(),
                 display_name: r.display_name.clone(),
+                scope: r.scope,
             })
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -689,6 +815,506 @@ impl RoleRepo for InMemoryRoleRepo {
             json!({ "user_id": user_id, "roles": role_names }),
         );
         Ok(())
+    }
+}
+
+/// 租户 + 成员关系的**共享**存储:内存下 `InMemoryTenantRepo` / `InMemoryMemberRepo` 经
+/// `sharing_with(&users)` 共用同一份,镜像 PG 共表。构造时就带默认租户(镜像迁移 0004 的插入)。
+struct TenantStore {
+    tenants: Mutex<Vec<Tenant>>, // 含已软删(slug 不复用要看它们)
+    members: Mutex<Vec<MemberRec>>,
+}
+
+impl Default for TenantStore {
+    fn default() -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            tenants: Mutex::new(vec![Tenant {
+                id: DEFAULT_TENANT_ID,
+                slug: "default".to_owned(),
+                name: "默认组织".to_owned(),
+                status: TenantStatus::Active,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            }]),
+            members: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+/// 成员内存行:`role_ids` 即该成员在该租户的 member_roles。
+struct MemberRec {
+    tenant_id: Uuid,
+    user_id: Uuid,
+    status: MemberStatus,
+    last_used_at: Option<OffsetDateTime>,
+    role_ids: Vec<Uuid>,
+}
+
+/// 内存侧 offset / cursor 分页(`rows` 已按 key 升序)。
+fn paginate<T>(rows: Vec<T>, page: &ListPage, key: impl Fn(&T) -> Uuid) -> ListResult<T> {
+    match *page {
+        ListPage::Offset {
+            offset,
+            limit,
+            with_total,
+        } => {
+            let total = with_total.then_some(rows.len() as u64);
+            ListResult {
+                rows: rows
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect(),
+                total,
+                next_after: None,
+            }
+        }
+        ListPage::Cursor { after, limit } => {
+            let kept: Vec<T> = rows
+                .into_iter()
+                .filter(|r| after.is_none_or(|a| key(r) > a))
+                .take(limit as usize + 1)
+                .collect();
+            super::finish_cursor_page(kept, limit, key)
+        }
+    }
+}
+
+/// 租户内存实现。
+pub struct InMemoryTenantRepo {
+    inner: Arc<TenantStore>,
+    outbox: Arc<OutboxStore>,
+}
+
+impl InMemoryTenantRepo {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(TenantStore::default()),
+            outbox: Arc::new(OutboxStore::default()),
+        }
+    }
+
+    /// 与给定 `InMemoryUserRepo` **共享**租户 / 成员 / 发件箱存储。
+    pub fn sharing_with(users: &InMemoryUserRepo) -> Self {
+        Self {
+            inner: Arc::clone(&users.tenants),
+            outbox: Arc::clone(&users.outbox),
+        }
+    }
+
+    /// 改一个存活租户并发 `event_type`;不存在 / 已软删 → `NotFound`。
+    fn mutate_alive(
+        &self,
+        id: Uuid,
+        event_type: &str,
+        f: impl FnOnce(&mut Tenant),
+    ) -> Result<Tenant, IdmError> {
+        let mut tenants = self.inner.tenants.lock().expect("锁未中毒");
+        let t = tenants
+            .iter_mut()
+            .find(|t| t.id == id && t.deleted_at.is_none())
+            .ok_or(IdmError::NotFound)?;
+        f(t);
+        t.updated_at = OffsetDateTime::now_utc();
+        let out = t.clone();
+        self.outbox
+            .emit(event_type, id, super::tenant_payload(&out));
+        Ok(out)
+    }
+}
+
+impl Default for InMemoryTenantRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn new_tenant(id: Uuid, slug: &str, name: &str) -> Tenant {
+    let now = OffsetDateTime::now_utc();
+    Tenant {
+        id,
+        slug: slug.to_owned(),
+        name: name.to_owned(),
+        status: TenantStatus::Active,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    }
+}
+
+const SLUG_TAKEN: &str = "Tenant slug already taken";
+
+#[async_trait]
+impl TenantRepo for InMemoryTenantRepo {
+    async fn create(
+        &self,
+        slug: &str,
+        name: &str,
+        _by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        let mut tenants = self.inner.tenants.lock().expect("锁未中毒");
+        // slug 唯一含已软删(镜像不带 deleted_at 条件的唯一索引)
+        if tenants.iter().any(|t| t.slug == slug) {
+            return Err(IdmError::Conflict(SLUG_TAKEN.to_owned()));
+        }
+        let t = new_tenant(Uuid::now_v7(), slug, name);
+        tenants.push(t.clone());
+        self.outbox
+            .emit("tenant.created", t.id, super::tenant_payload(&t));
+        Ok(t)
+    }
+
+    async fn upsert_fixed(
+        &self,
+        id: Uuid,
+        slug: &str,
+        name: &str,
+        _by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        let mut tenants = self.inner.tenants.lock().expect("锁未中毒");
+        if let Some(t) = tenants.iter().find(|t| t.id == id) {
+            return Ok(t.clone()); // 已在:原样返回,不改名、不发事件
+        }
+        if tenants.iter().any(|t| t.slug == slug) {
+            return Err(IdmError::Conflict(SLUG_TAKEN.to_owned()));
+        }
+        let t = new_tenant(id, slug, name);
+        tenants.push(t.clone());
+        self.outbox
+            .emit("tenant.created", t.id, super::tenant_payload(&t));
+        Ok(t)
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Tenant, IdmError> {
+        self.inner
+            .tenants
+            .lock()
+            .expect("锁未中毒")
+            .iter()
+            .find(|t| t.id == id && t.deleted_at.is_none())
+            .cloned()
+            .ok_or(IdmError::NotFound)
+    }
+
+    async fn get_by_slug(&self, slug: &str) -> Result<Tenant, IdmError> {
+        self.inner
+            .tenants
+            .lock()
+            .expect("锁未中毒")
+            .iter()
+            .find(|t| t.slug == slug && t.deleted_at.is_none())
+            .cloned()
+            .ok_or(IdmError::NotFound)
+    }
+
+    async fn list(&self, page: &ListPage) -> Result<ListResult<Tenant>, IdmError> {
+        let mut rows: Vec<Tenant> = self
+            .inner
+            .tenants
+            .lock()
+            .expect("锁未中毒")
+            .iter()
+            .filter(|t| t.deleted_at.is_none())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.id);
+        Ok(paginate(rows, page, |t| t.id))
+    }
+
+    async fn update_name(
+        &self,
+        id: Uuid,
+        name: &str,
+        _by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        self.mutate_alive(id, "tenant.updated", |t| t.name = name.to_owned())
+    }
+
+    async fn set_status(
+        &self,
+        id: Uuid,
+        status: TenantStatus,
+        _by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        self.mutate_alive(id, "tenant.updated", |t| t.status = status)
+    }
+
+    async fn soft_delete(&self, id: Uuid, _by: Option<String>) -> Result<(), IdmError> {
+        let mut tenants = self.inner.tenants.lock().expect("锁未中毒");
+        let t = tenants
+            .iter_mut()
+            .find(|t| t.id == id && t.deleted_at.is_none())
+            .ok_or(IdmError::NotFound)?;
+        let now = OffsetDateTime::now_utc();
+        t.deleted_at = Some(now);
+        t.updated_at = now;
+        let payload = json!({ "tenant_id": t.id, "slug": t.slug });
+        self.outbox.emit("tenant.deleted", id, payload);
+        Ok(())
+    }
+}
+
+/// 成员内存实现。与 `InMemoryUserRepo` 共享用户(FK 校验)、角色(名 + scope)、租户、发件箱存储。
+pub struct InMemoryMemberRepo {
+    users: Arc<Mutex<HashMap<Uuid, UserRow>>>,
+    roles: Arc<RoleStore>,
+    tenants: Arc<TenantStore>,
+    outbox: Arc<OutboxStore>,
+}
+
+impl InMemoryMemberRepo {
+    pub fn new() -> Self {
+        Self::sharing_with(&InMemoryUserRepo::new())
+    }
+
+    /// 与给定 `InMemoryUserRepo` **共享**用户 / 角色 / 租户 / 发件箱存储(镜像 PG 共表)。
+    pub fn sharing_with(users: &InMemoryUserRepo) -> Self {
+        Self {
+            users: Arc::clone(&users.store),
+            roles: Arc::clone(&users.roles),
+            tenants: Arc::clone(&users.tenants),
+            outbox: Arc::clone(&users.outbox),
+        }
+    }
+
+    fn tenant_role_names(&self, role_ids: &[Uuid]) -> Vec<String> {
+        tenant_role_names(&self.roles, role_ids)
+    }
+
+    /// 先校验:role_ids 都得存在(镜像 PG member_roles → roles 的 FK),否则 `NotFound`、不动任何存储。
+    fn check_roles_exist(&self, role_ids: &[Uuid]) -> Result<(), IdmError> {
+        resolve_role_names(&self.roles, role_ids).map(|_| ())
+    }
+
+    fn to_membership(&self, t: &Tenant, m: &MemberRec) -> Membership {
+        Membership {
+            tenant: t.clone(),
+            user_id: m.user_id,
+            status: m.status,
+            roles: self.tenant_role_names(&m.role_ids),
+            last_used_at: m.last_used_at,
+        }
+    }
+
+    /// 在成员行上改一下;不是成员 / 租户已软删 → `NotFound`。
+    fn with_member<R>(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        f: impl FnOnce(&mut MemberRec) -> R,
+    ) -> Result<R, IdmError> {
+        let mut members = self.tenants.members.lock().expect("锁未中毒");
+        self.ensure_tenant_alive(tenant_id)?;
+        let m = members
+            .iter_mut()
+            .find(|m| m.tenant_id == tenant_id && m.user_id == user_id)
+            .ok_or(IdmError::NotFound)?;
+        Ok(f(m))
+    }
+}
+
+impl InMemoryMemberRepo {
+    /// 租户须存活(未软删),否则 `NotFound` —— 成员写操作对已删租户一律 404(镜像 PG)。
+    /// 锁序:调用方已持 members 锁,这里再取 tenants 锁(与 get / list 同序)。
+    fn ensure_tenant_alive(&self, tenant_id: Uuid) -> Result<(), IdmError> {
+        let alive = self
+            .tenants
+            .tenants
+            .lock()
+            .expect("锁未中毒")
+            .iter()
+            .any(|t| t.id == tenant_id && t.deleted_at.is_none());
+        if alive {
+            Ok(())
+        } else {
+            Err(IdmError::NotFound)
+        }
+    }
+}
+
+impl Default for InMemoryMemberRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl MemberRepo for InMemoryMemberRepo {
+    async fn add(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        role_ids: &[Uuid],
+        _by: Option<String>,
+    ) -> Result<Membership, IdmError> {
+        // 先校验(各自短暂持锁,避免与 UserRepo::list 的锁序交叉),后改状态。
+        self.check_roles_exist(role_ids)?;
+        if !self.users.lock().expect("锁未中毒").contains_key(&user_id) {
+            return Err(IdmError::NotFound);
+        }
+        let mut members = self.tenants.members.lock().expect("锁未中毒");
+        let tenants = self.tenants.tenants.lock().expect("锁未中毒");
+        let tenant = tenants
+            .iter()
+            .find(|t| t.id == tenant_id && t.deleted_at.is_none())
+            .ok_or(IdmError::NotFound)?;
+        if members
+            .iter()
+            .any(|m| m.tenant_id == tenant_id && m.user_id == user_id)
+        {
+            return Err(IdmError::Conflict(
+                "Already a member of this tenant".to_owned(),
+            ));
+        }
+        let ids = dedup_ids(role_ids);
+        let rec = MemberRec {
+            tenant_id,
+            user_id,
+            status: MemberStatus::Active,
+            last_used_at: None,
+            role_ids: ids,
+        };
+        let out = self.to_membership(tenant, &rec);
+        members.push(rec);
+        self.outbox.emit(
+            "tenant.member_added",
+            tenant_id,
+            super::member_payload(tenant_id, user_id, Some(out.status), Some(&out.roles)),
+        );
+        Ok(out)
+    }
+
+    async fn remove(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        _by: Option<String>,
+    ) -> Result<(), IdmError> {
+        let mut members = self.tenants.members.lock().expect("锁未中毒");
+        self.ensure_tenant_alive(tenant_id)?;
+        let before = members.len();
+        members.retain(|m| !(m.tenant_id == tenant_id && m.user_id == user_id));
+        if members.len() == before {
+            return Err(IdmError::NotFound);
+        }
+        self.outbox.emit(
+            "tenant.member_removed",
+            tenant_id,
+            super::member_payload(tenant_id, user_id, None, None),
+        );
+        Ok(())
+    }
+
+    async fn set_status(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        status: MemberStatus,
+        _by: Option<String>,
+    ) -> Result<(), IdmError> {
+        self.with_member(tenant_id, user_id, |m| m.status = status)?;
+        self.outbox.emit(
+            "tenant.member_updated",
+            tenant_id,
+            super::member_payload(tenant_id, user_id, Some(status), None),
+        );
+        Ok(())
+    }
+
+    async fn set_roles(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        role_ids: &[Uuid],
+        _by: Option<String>,
+    ) -> Result<(), IdmError> {
+        self.check_roles_exist(role_ids)?;
+        let ids = dedup_ids(role_ids);
+        let names = self.tenant_role_names(&ids);
+        self.with_member(tenant_id, user_id, |m| m.role_ids = ids)?;
+        self.outbox.emit(
+            "tenant.member_roles_set",
+            tenant_id,
+            super::member_payload(tenant_id, user_id, None, Some(&names)),
+        );
+        Ok(())
+    }
+
+    async fn get(&self, tenant_id: Uuid, user_id: Uuid) -> Result<Option<Membership>, IdmError> {
+        let members = self.tenants.members.lock().expect("锁未中毒");
+        let tenants = self.tenants.tenants.lock().expect("锁未中毒");
+        let Some(t) = tenants
+            .iter()
+            .find(|t| t.id == tenant_id && t.deleted_at.is_none())
+        else {
+            return Ok(None);
+        };
+        Ok(members
+            .iter()
+            .find(|m| m.tenant_id == tenant_id && m.user_id == user_id)
+            .map(|m| self.to_membership(t, m)))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        page: &ListPage,
+    ) -> Result<ListResult<Membership>, IdmError> {
+        let members = self.tenants.members.lock().expect("锁未中毒");
+        let tenants = self.tenants.tenants.lock().expect("锁未中毒");
+        let rows = match tenants
+            .iter()
+            .find(|t| t.id == tenant_id && t.deleted_at.is_none())
+        {
+            Some(t) => {
+                let mut rows: Vec<Membership> = members
+                    .iter()
+                    .filter(|m| m.tenant_id == tenant_id)
+                    .map(|m| self.to_membership(t, m))
+                    .collect();
+                rows.sort_by_key(|m| m.user_id);
+                rows
+            }
+            None => Vec::new(),
+        };
+        Ok(paginate(rows, page, |m| m.user_id))
+    }
+
+    async fn memberships_for_user(&self, user_id: Uuid) -> Result<Vec<Membership>, IdmError> {
+        let members = self.tenants.members.lock().expect("锁未中毒");
+        let tenants = self.tenants.tenants.lock().expect("锁未中毒");
+        let mut out: Vec<Membership> = members
+            .iter()
+            .filter(|m| m.user_id == user_id && m.status == MemberStatus::Active)
+            .filter_map(|m| {
+                tenants
+                    .iter()
+                    .find(|t| {
+                        t.id == m.tenant_id
+                            && t.deleted_at.is_none()
+                            && t.status == TenantStatus::Active
+                    })
+                    .map(|t| self.to_membership(t, m))
+            })
+            .collect();
+        // last_used_at 降序、NULL 最后,再按租户 id 升序(镜像 PG ORDER BY)
+        out.sort_by(|a, b| {
+            match (a.last_used_at, b.last_used_at) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+            .then_with(|| a.tenant.id.cmp(&b.tenant.id))
+        });
+        Ok(out)
+    }
+
+    async fn touch_last_used(&self, tenant_id: Uuid, user_id: Uuid) -> Result<(), IdmError> {
+        let now = OffsetDateTime::now_utc();
+        self.with_member(tenant_id, user_id, |m| m.last_used_at = Some(now))
     }
 }
 

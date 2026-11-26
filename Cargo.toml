@@ -2,7 +2,7 @@
 # 被 app 当 lib 依赖(app 在自己的 features/auth 建 HTTP 边界);也能独立做 repo 一致性测试。迁移表见 migrations/。
 [package]
 name = "idm"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained auth / IDM domain & service library: AuthService + pluggable repos + its own IdmError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and cookies."

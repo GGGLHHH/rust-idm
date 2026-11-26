@@ -25,6 +25,17 @@
 8. **注释、文档用中文**;代码标识符英文。
 9. **提交需许可**:未经明确同意不要 commit / push / 打 tag。
 
+## 多租户 / token 约定(0.6.0 起)
+
+- token claim:`roles` = **平台角色**、`tenant_id`(平台上下文时缺省)= 当前租户、`tenant_roles` = 当前租户角色。
+  新 claim 一律 `#[serde(default)]`,旧 token 必须还能验(有用例 `old_token_without_tenant_claims_still_verifies`)。
+- 会话带 `tenant_id`;refresh **沿用**它并重新校验成员关系 + 租户状态,失效 → `Unauthorized`,绝不换到别的租户。
+  切换租户非有效成员 → `Forbidden`。
+- `MemberRepo` 是 `AuthService::new` / `builder` 的必填参数:多租户恒开,**不许加关闭开关 / 悄悄降级**;
+  注册 = `UserRepo::create_with_membership` 一个事务。
+- 成员写操作(set_status / set_roles / touch_last_used / remove)对已软删租户一律 `NotFound`;内存会话仓储建会话时
+  校验租户行存在(镜像 PG 外键)—— 内存仓储之间共享存储用 `sharing_with(&users)`。
+
 ## 命令
 
 `just check` · `just test` · `just test-pg` · `just lint` · `just fmt` · `just fix` · `just watch`

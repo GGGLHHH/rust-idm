@@ -10,5 +10,10 @@ use uuid::Uuid;
 pub struct AuthUser {
     pub id: Uuid,
     pub username: String,
+    /// **平台角色**(经 `user_roles` 授予,如 superadmin)。
     pub roles: Vec<String>,
+    /// 当前租户;`None` = 平台上下文(没有有效成员关系 / 旧 token)。
+    pub tenant_id: Option<Uuid>,
+    /// 当前租户内的角色(`tenant_id` 为 `None` 时为空)。
+    pub tenant_roles: Vec<String>,
 }

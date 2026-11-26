@@ -13,11 +13,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ListPage, Outbox, OutboxRecord, OutboxRepo, Role, RoleRepo, Roles, Session, SessionRepo,
-    Sessions, SortDir, User, UserListFilter, UserListResult, UserListRow, UserPassword, UserRepo,
-    UserRoles, UserSortBy, UserWithHash, Users,
+    finish_cursor_page, member_payload, tenant_payload, user_created_payload, ListPage, ListResult,
+    MemberRepo, MemberRoles, Outbox, OutboxRecord, OutboxRepo, Role, RoleRepo, Roles, Session,
+    SessionRepo, Sessions, SortDir, TenantMembers, TenantRepo, Tenants, User, UserListFilter,
+    UserListResult, UserListRow, UserPassword, UserRepo, UserRoles, UserSortBy, UserWithHash,
+    Users,
 };
 use crate::error::IdmError;
+use crate::tenant::{MemberStatus, Membership, RoleScope, Tenant, TenantStatus};
 
 /// EXISTS/NOT EXISTS 子查询:该 user 拥有名在 `names` 里的存活角色。相关子查询(引用外层 `users.id`)。
 fn user_has_role_subquery(names: &[String]) -> SelectStatement {
@@ -73,15 +76,66 @@ fn map_unique(e: sqlx::Error, msg: &str) -> IdmError {
     IdmError::Internal(e.into())
 }
 
-/// `user_roles.role_id` 外键冲突(role_id 不存在)→ `NotFound`,镜像内存 `resolve_role_names`
-/// 对非法 role_id 的语义;其它库错误 → `Internal`(原始进日志)。
-fn map_role_fk(e: sqlx::Error) -> IdmError {
+/// 外键冲突(引用的角色 / 租户 / 用户不存在,如 `user_roles.role_id`)→ `NotFound`,镜像内存
+/// `resolve_role_names` 对非法 role_id 的语义;其它库错误 → `Internal`(原始进日志)。
+fn map_fk_not_found(e: sqlx::Error) -> IdmError {
     if let sqlx::Error::Database(db) = &e {
         if db.is_foreign_key_violation() {
             return IdmError::NotFound;
         }
     }
     IdmError::Internal(e.into())
+}
+
+/// 建号三处(create / create_with_roles / create_with_membership)共用:在调用方事务里插 users + user_password
+/// (凭据分表),返回新用户。username / email 撞存活唯一索引 → `Conflict`。
+async fn insert_user_with_password(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    id: Uuid,
+    username: &str,
+    email: Option<&str>,
+    password_hash: &str,
+    by: Option<String>,
+) -> Result<User, IdmError> {
+    let (usql, uvalues) = Query::insert()
+        .into_table(Users::Table)
+        .columns([
+            Users::Id,
+            Users::Username,
+            Users::Email,
+            Users::CreatedBy,
+            Users::UpdatedBy,
+        ])
+        .values_panic([
+            id.into(),
+            username.to_owned().into(),
+            email.map(str::to_owned).into(),
+            by.clone().into(),
+            by.into(),
+        ])
+        .returning(Query::returning().columns([
+            Users::Id,
+            Users::Username,
+            Users::Email,
+            Users::EmailVerified,
+            Users::CreatedAt,
+        ]))
+        .build_sqlx(PostgresQueryBuilder);
+    let user = sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(usql), uvalues)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| map_unique(e, "Username or email already taken"))?;
+
+    let (psql, pvalues) = Query::insert()
+        .into_table(UserPassword::Table)
+        .columns([UserPassword::UserId, UserPassword::PasswordHash])
+        .values_panic([id.into(), password_hash.to_owned().into()])
+        .build_sqlx(PostgresQueryBuilder);
+    sqlx::query_with::<Postgres, _>(AssertSqlSafe(psql), pvalues)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| IdmError::Internal(e.into()))?;
+    Ok(user)
 }
 
 // ── 用户 ──
@@ -124,57 +178,14 @@ impl UserRepo for PgUserRepo {
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
 
-        let (usql, uvalues) = Query::insert()
-            .into_table(Users::Table)
-            .columns([
-                Users::Id,
-                Users::Username,
-                Users::Email,
-                Users::CreatedBy,
-                Users::UpdatedBy,
-            ])
-            .values_panic([
-                id.into(),
-                username.to_owned().into(),
-                email.map(str::to_owned).into(),
-                by.clone().into(),
-                by.into(),
-            ])
-            .returning(Query::returning().columns([
-                Users::Id,
-                Users::Username,
-                Users::Email,
-                Users::EmailVerified,
-                Users::CreatedAt,
-            ]))
-            .build_sqlx(PostgresQueryBuilder);
-        let user = sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(usql), uvalues)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| map_unique(e, "Username or email already taken"))?;
-
-        let (psql, pvalues) = Query::insert()
-            .into_table(UserPassword::Table)
-            .columns([UserPassword::UserId, UserPassword::PasswordHash])
-            .values_panic([id.into(), password_hash.to_owned().into()])
-            .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with::<Postgres, _>(AssertSqlSafe(psql), pvalues)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IdmError::Internal(e.into()))?;
+        let user =
+            insert_user_with_password(&mut tx, id, username, email, password_hash, by).await?;
 
         emit_outbox(
             &mut tx,
             "user.created",
             user.id,
-            json!({
-                "user_id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "email_verified": user.email_verified,
-                "created_at": user.created_at,
-                "roles": Vec::<String>::new(),
-            }),
+            user_created_payload(&user, &[]),
         )
         .await?;
 
@@ -408,44 +419,9 @@ impl UserRepo for PgUserRepo {
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
 
-        let (usql, uvalues) = Query::insert()
-            .into_table(Users::Table)
-            .columns([
-                Users::Id,
-                Users::Username,
-                Users::Email,
-                Users::CreatedBy,
-                Users::UpdatedBy,
-            ])
-            .values_panic([
-                id.into(),
-                username.to_owned().into(),
-                email.map(str::to_owned).into(),
-                by.clone().into(),
-                by.clone().into(),
-            ])
-            .returning(Query::returning().columns([
-                Users::Id,
-                Users::Username,
-                Users::Email,
-                Users::EmailVerified,
-                Users::CreatedAt,
-            ]))
-            .build_sqlx(PostgresQueryBuilder);
-        let user = sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(usql), uvalues)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| map_unique(e, "Username or email already taken"))?;
-
-        let (psql, pvalues) = Query::insert()
-            .into_table(UserPassword::Table)
-            .columns([UserPassword::UserId, UserPassword::PasswordHash])
-            .values_panic([id.into(), password_hash.to_owned().into()])
-            .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with::<Postgres, _>(AssertSqlSafe(psql), pvalues)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| IdmError::Internal(e.into()))?;
+        let user =
+            insert_user_with_password(&mut tx, id, username, email, password_hash, by.clone())
+                .await?;
 
         if !role_ids.is_empty() {
             let mut q = Query::insert();
@@ -466,7 +442,7 @@ impl UserRepo for PgUserRepo {
             sqlx::query_with::<Postgres, _>(AssertSqlSafe(rsql), rvalues)
                 .execute(&mut *tx)
                 .await
-                .map_err(map_role_fk)?;
+                .map_err(map_fk_not_found)?;
         }
 
         let role_names = resolve_role_names(&mut tx, role_ids).await?;
@@ -474,20 +450,78 @@ impl UserRepo for PgUserRepo {
             &mut tx,
             "user.created",
             user.id,
-            json!({
-                "user_id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "email_verified": user.email_verified,
-                "created_at": user.created_at,
-                "roles": role_names,
-            }),
+            user_created_payload(&user, &role_names),
         )
         .await?;
 
         tx.commit()
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(user)
+    }
+
+    #[tracing::instrument(name = "pg.users.create_with_membership", skip_all)]
+    async fn create_with_membership(
+        &self,
+        username: &str,
+        email: Option<&str>,
+        password_hash: &str,
+        tenant_id: Uuid,
+        role_ids: &[Uuid],
+        by: Option<String>,
+    ) -> Result<User, IdmError> {
+        let id = Uuid::now_v7();
+        // 一个事务:users + user_password +(租户可加入时)tenant_members + member_roles,任一步失败整体回滚。
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+
+        let user =
+            insert_user_with_password(&mut tx, id, username, email, password_hash, by.clone())
+                .await?;
+
+        emit_outbox(
+            &mut tx,
+            "user.created",
+            user.id,
+            user_created_payload(&user, &[]),
+        )
+        .await?;
+
+        // 租户须存活且 active(FOR SHARE:挡住同时进行的软删 / 停用);否则只建账号。
+        let joinable: Option<i32> = sqlx::query_scalar(
+            "select 1 from tenants where id = $1 and deleted_at is null and status = 'active' for share",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if joinable.is_some() {
+            let (msql, mvalues) = Query::insert()
+                .into_table(TenantMembers::Table)
+                .columns([
+                    TenantMembers::TenantId,
+                    TenantMembers::UserId,
+                    TenantMembers::AddedBy,
+                ])
+                .values_panic([tenant_id.into(), id.into(), by.clone().into()])
+                .build_sqlx(PostgresQueryBuilder);
+            sqlx::query_with::<Postgres, _>(AssertSqlSafe(msql), mvalues)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+            insert_member_roles(&mut tx, tenant_id, id, role_ids, &by).await?;
+            let m = fetch_membership(&mut *tx, tenant_id, id)
+                .await?
+                .ok_or_else(|| IdmError::Internal(anyhow::anyhow!("刚插入的成员读不回")))?;
+            emit_outbox(
+                &mut tx,
+                "tenant.member_added",
+                tenant_id,
+                member_payload(tenant_id, id, Some(m.status), Some(&m.roles)),
+            )
+            .await?;
+        }
+
+        tx.commit().await.map_err(internal)?;
         Ok(user)
     }
 
@@ -611,6 +645,7 @@ impl SessionRepo for PgSessionRepo {
     async fn create(
         &self,
         user_id: Uuid,
+        tenant_id: Option<Uuid>,
         token_hash: &str,
         expires_at: OffsetDateTime,
         by: Option<String>,
@@ -621,6 +656,7 @@ impl SessionRepo for PgSessionRepo {
             .columns([
                 Sessions::Id,
                 Sessions::UserId,
+                Sessions::TenantId,
                 Sessions::TokenHash,
                 Sessions::ExpiresAt,
                 Sessions::CreatedBy,
@@ -629,6 +665,7 @@ impl SessionRepo for PgSessionRepo {
             .values_panic([
                 id.into(),
                 user_id.into(),
+                tenant_id.into(),
                 token_hash.to_owned().into(),
                 expires_at.into(),
                 by.clone().into(),
@@ -638,8 +675,12 @@ impl SessionRepo for PgSessionRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| IdmError::Internal(e.into()))?;
-        Ok(Session { id, user_id })
+            .map_err(map_fk_not_found)?;
+        Ok(Session {
+            id,
+            user_id,
+            tenant_id,
+        })
     }
 
     #[tracing::instrument(name = "pg.sessions.find_active", skip_all)]
@@ -649,7 +690,7 @@ impl SessionRepo for PgSessionRepo {
         now: OffsetDateTime,
     ) -> Result<Option<Session>, IdmError> {
         let (sql, values) = Query::select()
-            .columns([Sessions::Id, Sessions::UserId])
+            .columns([Sessions::Id, Sessions::UserId, Sessions::TenantId])
             .from(Sessions::Table)
             .and_where(Expr::col(Sessions::TokenHash).eq(token_hash))
             .and_where(Expr::col(Sessions::RevokedAt).is_null())
@@ -693,6 +734,37 @@ impl SessionRepo for PgSessionRepo {
             .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
+
+    #[tracing::instrument(name = "pg.sessions.revoke_for_member", skip_all)]
+    async fn revoke_for_member(&self, tenant_id: Uuid, user_id: Uuid) -> Result<(), IdmError> {
+        let (sql, values) = Query::update()
+            .table(Sessions::Table)
+            .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(Sessions::TenantId).eq(tenant_id))
+            .and_where(Expr::col(Sessions::UserId).eq(user_id))
+            .and_where(Expr::col(Sessions::RevokedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "pg.sessions.revoke_for_tenant", skip_all)]
+    async fn revoke_for_tenant(&self, tenant_id: Uuid) -> Result<(), IdmError> {
+        let (sql, values) = Query::update()
+            .table(Sessions::Table)
+            .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(Sessions::TenantId).eq(tenant_id))
+            .and_where(Expr::col(Sessions::RevokedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(())
+    }
 }
 
 // ── 角色 ──
@@ -713,20 +785,35 @@ impl RoleRepo for PgRoleRepo {
         &self,
         name: &str,
         display_name: &str,
+        scope: RoleScope,
         by: Option<String>,
     ) -> Result<Uuid, IdmError> {
         // 幂等:先查存活同名(seed 单次串行跑,并发竞态可忽略;真要强一致再加 ON CONFLICT)。
         let (ssql, svalues) = Query::select()
-            .column(Roles::Id)
+            .columns([Roles::Id, Roles::Scope])
             .from(Roles::Table)
             .and_where(Expr::col(Roles::Name).eq(name))
             .and_where(Expr::col(Roles::DeletedAt).is_null())
             .build_sqlx(PostgresQueryBuilder);
-        if let Some(id) = sqlx::query_scalar_with::<Postgres, Uuid, _>(AssertSqlSafe(ssql), svalues)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| IdmError::Internal(e.into()))?
+        if let Some((id, current)) =
+            sqlx::query_as_with::<Postgres, (Uuid, String), _>(AssertSqlSafe(ssql), svalues)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| IdmError::Internal(e.into()))?
         {
+            // scope 以调用方代码闭集为准:迁移出来的默认 'tenant' 由此收敛
+            if current != scope.as_str() {
+                let (usql, uvalues) = Query::update()
+                    .table(Roles::Table)
+                    .value(Roles::Scope, scope.as_str())
+                    .value(Roles::UpdatedBy, by)
+                    .and_where(Expr::col(Roles::Id).eq(id))
+                    .build_sqlx(PostgresQueryBuilder);
+                sqlx::query_with::<Postgres, _>(AssertSqlSafe(usql), uvalues)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| IdmError::Internal(e.into()))?;
+            }
             return Ok(id);
         }
         let id = Uuid::now_v7();
@@ -736,6 +823,7 @@ impl RoleRepo for PgRoleRepo {
                 Roles::Id,
                 Roles::Name,
                 Roles::DisplayName,
+                Roles::Scope,
                 Roles::CreatedBy,
                 Roles::UpdatedBy,
             ])
@@ -743,6 +831,7 @@ impl RoleRepo for PgRoleRepo {
                 id.into(),
                 name.to_owned().into(),
                 display_name.to_owned().into(),
+                scope.as_str().into(),
                 by.clone().into(),
                 by.into(),
             ])
@@ -781,7 +870,7 @@ impl RoleRepo for PgRoleRepo {
     #[tracing::instrument(name = "pg.roles.roles_for_user", skip_all)]
     async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         // SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id
-        //   WHERE ur.user_id = $ AND r.deleted_at IS NULL
+        //   WHERE ur.user_id = $ AND r.deleted_at IS NULL AND r.scope = 'platform'(只回平台角色)
         let (sql, values) = Query::select()
             .column((Roles::Table, Roles::Name))
             .from(UserRoles::Table)
@@ -791,6 +880,7 @@ impl RoleRepo for PgRoleRepo {
             )
             .and_where(Expr::col((UserRoles::Table, UserRoles::UserId)).eq(user_id))
             .and_where(Expr::col((Roles::Table, Roles::DeletedAt)).is_null())
+            .and_where(Expr::col((Roles::Table, Roles::Scope)).eq(RoleScope::Platform.as_str()))
             .build_sqlx(PostgresQueryBuilder);
         sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
             .fetch_all(&self.pool)
@@ -800,9 +890,9 @@ impl RoleRepo for PgRoleRepo {
 
     #[tracing::instrument(name = "pg.roles.list", skip_all)]
     async fn list(&self) -> Result<Vec<Role>, IdmError> {
-        // SELECT id, name, display_name FROM roles WHERE deleted_at IS NULL ORDER BY name
+        // SELECT id, name, display_name, scope FROM roles WHERE deleted_at IS NULL ORDER BY name
         let (sql, values) = Query::select()
-            .columns([Roles::Id, Roles::Name, Roles::DisplayName])
+            .columns([Roles::Id, Roles::Name, Roles::DisplayName, Roles::Scope])
             .from(Roles::Table)
             .and_where(Expr::col(Roles::DeletedAt).is_null())
             .order_by(Roles::Name, Order::Asc)
@@ -855,7 +945,7 @@ impl RoleRepo for PgRoleRepo {
             sqlx::query_with::<Postgres, _>(AssertSqlSafe(isql), ivalues)
                 .execute(&mut *tx)
                 .await
-                .map_err(map_role_fk)?;
+                .map_err(map_fk_not_found)?;
         }
 
         let role_names = resolve_role_names(&mut tx, role_ids).await?;
@@ -870,6 +960,668 @@ impl RoleRepo for PgRoleRepo {
         tx.commit()
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
+        Ok(())
+    }
+}
+
+// ── 租户 ──
+
+const SLUG_TAKEN: &str = "Tenant slug already taken";
+
+/// 租户读回的列(与 `Tenant` 的 FromRow 字段一一对应)。
+fn tenant_cols() -> [Tenants; 7] {
+    [
+        Tenants::Id,
+        Tenants::Slug,
+        Tenants::Name,
+        Tenants::Status,
+        Tenants::CreatedAt,
+        Tenants::UpdatedAt,
+        Tenants::DeletedAt,
+    ]
+}
+
+fn internal(e: sqlx::Error) -> IdmError {
+    IdmError::Internal(e.into())
+}
+
+pub struct PgTenantRepo {
+    pool: PgPool,
+}
+impl PgTenantRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 改一个存活租户(UPDATE ... RETURNING)+ 同事务发 `tenant.updated`。不存在 / 已软删 → `NotFound`。
+    async fn update_alive(
+        &self,
+        id: Uuid,
+        col: Tenants,
+        value: sea_query::Value,
+        by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (sql, values) = Query::update()
+            .table(Tenants::Table)
+            .value(col, value)
+            .value(Tenants::UpdatedBy, by)
+            .and_where(Expr::col(Tenants::Id).eq(id))
+            .and_where(Expr::col(Tenants::DeletedAt).is_null())
+            .returning(Query::returning().columns(tenant_cols()))
+            .build_sqlx(PostgresQueryBuilder);
+        let t = sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?
+            .ok_or(IdmError::NotFound)?;
+        emit_outbox(&mut tx, "tenant.updated", t.id, tenant_payload(&t)).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(t)
+    }
+
+    /// 按单列等值查存活租户。
+    async fn get_alive_by(&self, cond: sea_query::SimpleExpr) -> Result<Tenant, IdmError> {
+        let (sql, values) = Query::select()
+            .columns(tenant_cols())
+            .from(Tenants::Table)
+            .and_where(cond)
+            .and_where(Expr::col(Tenants::DeletedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(internal)?
+            .ok_or(IdmError::NotFound)
+    }
+}
+
+#[async_trait]
+impl TenantRepo for PgTenantRepo {
+    #[tracing::instrument(name = "pg.tenants.create", skip_all)]
+    async fn create(&self, slug: &str, name: &str, by: Option<String>) -> Result<Tenant, IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (sql, values) = Query::insert()
+            .into_table(Tenants::Table)
+            .columns([
+                Tenants::Id,
+                Tenants::Slug,
+                Tenants::Name,
+                Tenants::CreatedBy,
+                Tenants::UpdatedBy,
+            ])
+            .values_panic([
+                Uuid::now_v7().into(),
+                slug.to_owned().into(),
+                name.to_owned().into(),
+                by.clone().into(),
+                by.into(),
+            ])
+            .returning(Query::returning().columns(tenant_cols()))
+            .build_sqlx(PostgresQueryBuilder);
+        let t = sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| map_unique(e, SLUG_TAKEN))?;
+        emit_outbox(&mut tx, "tenant.created", t.id, tenant_payload(&t)).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(t)
+    }
+
+    #[tracing::instrument(name = "pg.tenants.upsert_fixed", skip_all)]
+    async fn upsert_fixed(
+        &self,
+        id: Uuid,
+        slug: &str,
+        name: &str,
+        by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        // ON CONFLICT (id) DO NOTHING:并发 seed 也只建一次;slug 被别的 id 占 → 唯一冲突 → Conflict。
+        let (sql, values) = Query::insert()
+            .into_table(Tenants::Table)
+            .columns([
+                Tenants::Id,
+                Tenants::Slug,
+                Tenants::Name,
+                Tenants::CreatedBy,
+                Tenants::UpdatedBy,
+            ])
+            .values_panic([
+                id.into(),
+                slug.to_owned().into(),
+                name.to_owned().into(),
+                by.clone().into(),
+                by.into(),
+            ])
+            .on_conflict(OnConflict::column(Tenants::Id).do_nothing().to_owned())
+            .returning(Query::returning().columns(tenant_cols()))
+            .build_sqlx(PostgresQueryBuilder);
+        let inserted = sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_unique(e, SLUG_TAKEN))?;
+        let t = match inserted {
+            Some(t) => {
+                emit_outbox(&mut tx, "tenant.created", t.id, tenant_payload(&t)).await?;
+                t
+            }
+            None => {
+                // 已在(含已软删):原样返回,不改名、不发事件
+                let (ssql, svalues) = Query::select()
+                    .columns(tenant_cols())
+                    .from(Tenants::Table)
+                    .and_where(Expr::col(Tenants::Id).eq(id))
+                    .build_sqlx(PostgresQueryBuilder);
+                sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(ssql), svalues)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal)?
+            }
+        };
+        tx.commit().await.map_err(internal)?;
+        Ok(t)
+    }
+
+    #[tracing::instrument(name = "pg.tenants.get", skip_all)]
+    async fn get(&self, id: Uuid) -> Result<Tenant, IdmError> {
+        self.get_alive_by(Expr::col(Tenants::Id).eq(id)).await
+    }
+
+    #[tracing::instrument(name = "pg.tenants.get_by_slug", skip_all)]
+    async fn get_by_slug(&self, slug: &str) -> Result<Tenant, IdmError> {
+        self.get_alive_by(Expr::col(Tenants::Slug).eq(slug)).await
+    }
+
+    #[tracing::instrument(name = "pg.tenants.list", skip_all)]
+    async fn list(&self, page: &ListPage) -> Result<ListResult<Tenant>, IdmError> {
+        let mut q = Query::select();
+        q.columns(tenant_cols())
+            .from(Tenants::Table)
+            .and_where(Expr::col(Tenants::DeletedAt).is_null())
+            .order_by(Tenants::Id, Order::Asc);
+        match *page {
+            ListPage::Offset {
+                offset,
+                limit,
+                with_total,
+            } => {
+                q.limit(limit).offset(offset);
+                let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+                let rows = sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(internal)?;
+                let total = if with_total {
+                    let (csql, cvalues) = Query::select()
+                        .expr(Expr::col(Tenants::Id).count())
+                        .from(Tenants::Table)
+                        .and_where(Expr::col(Tenants::DeletedAt).is_null())
+                        .build_sqlx(PostgresQueryBuilder);
+                    let n =
+                        sqlx::query_scalar_with::<Postgres, i64, _>(AssertSqlSafe(csql), cvalues)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(internal)?;
+                    Some(n as u64)
+                } else {
+                    None
+                };
+                Ok(ListResult {
+                    rows,
+                    total,
+                    next_after: None,
+                })
+            }
+            ListPage::Cursor { after, limit } => {
+                if let Some(a) = after {
+                    q.and_where(Expr::col(Tenants::Id).gt(a));
+                }
+                q.limit(limit + 1);
+                let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+                let rows = sqlx::query_as_with::<Postgres, Tenant, _>(AssertSqlSafe(sql), values)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(internal)?;
+                Ok(finish_cursor_page(rows, limit, |t| t.id))
+            }
+        }
+    }
+
+    #[tracing::instrument(name = "pg.tenants.update_name", skip_all)]
+    async fn update_name(
+        &self,
+        id: Uuid,
+        name: &str,
+        by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        self.update_alive(id, Tenants::Name, name.to_owned().into(), by)
+            .await
+    }
+
+    #[tracing::instrument(name = "pg.tenants.set_status", skip_all)]
+    async fn set_status(
+        &self,
+        id: Uuid,
+        status: TenantStatus,
+        by: Option<String>,
+    ) -> Result<Tenant, IdmError> {
+        self.update_alive(id, Tenants::Status, status.as_str().into(), by)
+            .await
+    }
+
+    #[tracing::instrument(name = "pg.tenants.soft_delete", skip_all)]
+    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (sql, values) = Query::update()
+            .table(Tenants::Table)
+            .value(Tenants::DeletedAt, OffsetDateTime::now_utc())
+            .value(Tenants::UpdatedBy, by)
+            .and_where(Expr::col(Tenants::Id).eq(id))
+            .and_where(Expr::col(Tenants::DeletedAt).is_null())
+            .returning(Query::returning().column(Tenants::Slug))
+            .build_sqlx(PostgresQueryBuilder);
+        let slug = sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?
+            .ok_or(IdmError::NotFound)?;
+        emit_outbox(
+            &mut tx,
+            "tenant.deleted",
+            id,
+            json!({ "tenant_id": id, "slug": slug }),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(())
+    }
+}
+
+// ── 成员 ──
+
+/// 成员关系读回的公共 SELECT(tenant_members m JOIN 存活 tenants t)。`roles` = 相关子查询聚合
+/// 该成员在该租户的**存活租户角色**(scope = 'tenant',按字节序排序,parity 内存 sort)。
+/// 宏而非 const:要在 `concat!` 里拼出各查询的 'static SQL(免 AssertSqlSafe)。调用方接 `and ...` 与 ORDER BY。
+macro_rules! membership_select {
+    () => {
+        r#"select t.id, t.slug, t.name, t.status, t.created_at, t.updated_at, t.deleted_at,
+       m.user_id, m.status as member_status, m.last_used_at,
+       array(select r.name from member_roles mr join roles r on r.id = mr.role_id
+             where mr.tenant_id = m.tenant_id and mr.user_id = m.user_id
+               and r.deleted_at is null and r.scope = 'tenant'
+             order by r.name collate "C") as roles
+from tenant_members m
+join tenants t on t.id = m.tenant_id
+where t.deleted_at is null"#
+    };
+}
+
+#[derive(sqlx::FromRow)]
+struct MembershipRow {
+    #[sqlx(flatten)]
+    tenant: Tenant,
+    user_id: Uuid,
+    #[sqlx(try_from = "String")]
+    member_status: MemberStatus,
+    last_used_at: Option<OffsetDateTime>,
+    roles: Vec<String>,
+}
+
+impl From<MembershipRow> for Membership {
+    fn from(r: MembershipRow) -> Self {
+        Membership {
+            tenant: r.tenant,
+            user_id: r.user_id,
+            status: r.member_status,
+            roles: r.roles,
+            last_used_at: r.last_used_at,
+        }
+    }
+}
+
+/// 查单个成员关系(任何状态)。在事务里也能用(add 读回)。
+async fn fetch_membership<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<Membership>, IdmError> {
+    const SQL: &str = concat!(
+        membership_select!(),
+        " and m.tenant_id = $1 and m.user_id = $2"
+    );
+    sqlx::query_as::<Postgres, MembershipRow>(SQL)
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(exec)
+        .await
+        .map(|r| r.map(Membership::from))
+        .map_err(internal)
+}
+
+/// 往 member_roles 批量插(去重靠主键冲突跳过)。role_id 不存在 → FK → `NotFound`。
+async fn insert_member_roles(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    role_ids: &[Uuid],
+    by: &Option<String>,
+) -> Result<(), IdmError> {
+    if role_ids.is_empty() {
+        return Ok(());
+    }
+    let mut q = Query::insert();
+    q.into_table(MemberRoles::Table).columns([
+        MemberRoles::TenantId,
+        MemberRoles::UserId,
+        MemberRoles::RoleId,
+        MemberRoles::GrantedBy,
+    ]);
+    for rid in role_ids {
+        q.values_panic([
+            tenant_id.into(),
+            user_id.into(),
+            (*rid).into(),
+            by.clone().into(),
+        ]);
+    }
+    q.on_conflict(
+        OnConflict::columns([
+            MemberRoles::TenantId,
+            MemberRoles::UserId,
+            MemberRoles::RoleId,
+        ])
+        .do_nothing()
+        .to_owned(),
+    );
+    let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+    sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_fk_not_found)?;
+    Ok(())
+}
+
+/// 成员写操作的附加条件:成员所在租户未软删(已删租户的成员关系对写一律 `NotFound`,和读看不见一致)。
+const MEMBER_TENANT_ALIVE: &str = "exists (select 1 from tenants t where t.id = tenant_members.tenant_id and t.deleted_at is null)";
+
+pub struct PgMemberRepo {
+    pool: PgPool,
+}
+impl PgMemberRepo {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl MemberRepo for PgMemberRepo {
+    #[tracing::instrument(name = "pg.tenant_members.add", skip_all)]
+    async fn add(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        role_ids: &[Uuid],
+        by: Option<String>,
+    ) -> Result<Membership, IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        // 租户须存活(FOR SHARE:挡住同时进行的软删)。
+        let alive: Option<i32> = sqlx::query_scalar(
+            "select 1 from tenants where id = $1 and deleted_at is null for share",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if alive.is_none() {
+            return Err(IdmError::NotFound);
+        }
+        let (sql, values) = Query::insert()
+            .into_table(TenantMembers::Table)
+            .columns([
+                TenantMembers::TenantId,
+                TenantMembers::UserId,
+                TenantMembers::AddedBy,
+            ])
+            .values_panic([tenant_id.into(), user_id.into(), by.clone().into()])
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.is_unique_violation() => {
+                    IdmError::Conflict("Already a member of this tenant".to_owned())
+                }
+                _ => map_fk_not_found(e), // 用户不存在
+            })?;
+        insert_member_roles(&mut tx, tenant_id, user_id, role_ids, &by).await?;
+        let m = fetch_membership(&mut *tx, tenant_id, user_id)
+            .await?
+            .ok_or_else(|| IdmError::Internal(anyhow::anyhow!("刚插入的成员读不回")))?;
+        emit_outbox(
+            &mut tx,
+            "tenant.member_added",
+            tenant_id,
+            member_payload(tenant_id, user_id, Some(m.status), Some(&m.roles)),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(m)
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.remove", skip_all)]
+    async fn remove(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        _by: Option<String>,
+    ) -> Result<(), IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        // member_roles 经复合 FK ON DELETE CASCADE 一并删
+        let (sql, values) = Query::delete()
+            .from_table(TenantMembers::Table)
+            .and_where(Expr::col(TenantMembers::TenantId).eq(tenant_id))
+            .and_where(Expr::col(TenantMembers::UserId).eq(user_id))
+            .and_where(Expr::cust(MEMBER_TENANT_ALIVE))
+            .build_sqlx(PostgresQueryBuilder);
+        let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+        if res.rows_affected() == 0 {
+            return Err(IdmError::NotFound);
+        }
+        emit_outbox(
+            &mut tx,
+            "tenant.member_removed",
+            tenant_id,
+            member_payload(tenant_id, user_id, None, None),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.set_status", skip_all)]
+    async fn set_status(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        status: MemberStatus,
+        _by: Option<String>,
+    ) -> Result<(), IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let (sql, values) = Query::update()
+            .table(TenantMembers::Table)
+            .value(TenantMembers::Status, status.as_str())
+            .and_where(Expr::col(TenantMembers::TenantId).eq(tenant_id))
+            .and_where(Expr::col(TenantMembers::UserId).eq(user_id))
+            .and_where(Expr::cust(MEMBER_TENANT_ALIVE))
+            .build_sqlx(PostgresQueryBuilder);
+        let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+        if res.rows_affected() == 0 {
+            return Err(IdmError::NotFound);
+        }
+        emit_outbox(
+            &mut tx,
+            "tenant.member_updated",
+            tenant_id,
+            member_payload(tenant_id, user_id, Some(status), None),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.set_roles", skip_all)]
+    async fn set_roles(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        role_ids: &[Uuid],
+        by: Option<String>,
+    ) -> Result<(), IdmError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        // 成员须存在且租户未软删(FOR UPDATE:与并发 remove / set_roles 串行)
+        let exists: Option<i32> = sqlx::query_scalar(
+            "select 1 from tenant_members where tenant_id = $1 and user_id = $2 \
+             and exists (select 1 from tenants t where t.id = tenant_members.tenant_id and t.deleted_at is null) \
+             for update",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if exists.is_none() {
+            return Err(IdmError::NotFound);
+        }
+        let (dsql, dvalues) = Query::delete()
+            .from_table(MemberRoles::Table)
+            .and_where(Expr::col(MemberRoles::TenantId).eq(tenant_id))
+            .and_where(Expr::col(MemberRoles::UserId).eq(user_id))
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(dsql), dvalues)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+        insert_member_roles(&mut tx, tenant_id, user_id, role_ids, &by).await?;
+        let roles = fetch_membership(&mut *tx, tenant_id, user_id)
+            .await?
+            .map(|m| m.roles)
+            .unwrap_or_default();
+        emit_outbox(
+            &mut tx,
+            "tenant.member_roles_set",
+            tenant_id,
+            member_payload(tenant_id, user_id, None, Some(&roles)),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.get", skip_all)]
+    async fn get(&self, tenant_id: Uuid, user_id: Uuid) -> Result<Option<Membership>, IdmError> {
+        fetch_membership(&self.pool, tenant_id, user_id).await
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.list_by_tenant", skip_all)]
+    async fn list_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        page: &ListPage,
+    ) -> Result<ListResult<Membership>, IdmError> {
+        match *page {
+            ListPage::Offset {
+                offset,
+                limit,
+                with_total,
+            } => {
+                const SQL: &str = concat!(
+                    membership_select!(),
+                    " and m.tenant_id = $1 order by m.user_id limit $2 offset $3"
+                );
+                let rows = sqlx::query_as::<Postgres, MembershipRow>(SQL)
+                    .bind(tenant_id)
+                    .bind(limit as i64)
+                    .bind(offset as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(internal)?;
+                let total = if with_total {
+                    let n: i64 = sqlx::query_scalar(
+                        "select count(*) from tenant_members m join tenants t on t.id = m.tenant_id \
+                         where t.deleted_at is null and m.tenant_id = $1",
+                    )
+                    .bind(tenant_id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(internal)?;
+                    Some(n as u64)
+                } else {
+                    None
+                };
+                Ok(ListResult {
+                    rows: rows.into_iter().map(Membership::from).collect(),
+                    total,
+                    next_after: None,
+                })
+            }
+            ListPage::Cursor { after, limit } => {
+                // after 为空时用 nil UUID 作下界(user_id 不会是 nil)
+                const SQL: &str = concat!(
+                    membership_select!(),
+                    " and m.tenant_id = $1 and m.user_id > $2 order by m.user_id limit $3"
+                );
+                let rows = sqlx::query_as::<Postgres, MembershipRow>(SQL)
+                    .bind(tenant_id)
+                    .bind(after.unwrap_or(Uuid::nil()))
+                    .bind(limit as i64 + 1)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(internal)?;
+                let rows: Vec<Membership> = rows.into_iter().map(Membership::from).collect();
+                Ok(finish_cursor_page(rows, limit, |m| m.user_id))
+            }
+        }
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.memberships_for_user", skip_all)]
+    async fn memberships_for_user(&self, user_id: Uuid) -> Result<Vec<Membership>, IdmError> {
+        // 有效成员关系:成员 active + 租户 active(存活由公共 SELECT 保证);最近用过的在前
+        const SQL: &str = concat!(
+            membership_select!(),
+            " and m.user_id = $1 and m.status = 'active' and t.status = 'active'",
+            " order by m.last_used_at desc nulls last, t.id"
+        );
+        let rows = sqlx::query_as::<Postgres, MembershipRow>(SQL)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(internal)?;
+        Ok(rows.into_iter().map(Membership::from).collect())
+    }
+
+    #[tracing::instrument(name = "pg.tenant_members.touch_last_used", skip_all)]
+    async fn touch_last_used(&self, tenant_id: Uuid, user_id: Uuid) -> Result<(), IdmError> {
+        let (sql, values) = Query::update()
+            .table(TenantMembers::Table)
+            .value(TenantMembers::LastUsedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(TenantMembers::TenantId).eq(tenant_id))
+            .and_where(Expr::col(TenantMembers::UserId).eq(user_id))
+            .and_where(Expr::cust(MEMBER_TENANT_ALIVE))
+            .build_sqlx(PostgresQueryBuilder);
+        let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(internal)?;
+        if res.rows_affected() == 0 {
+            return Err(IdmError::NotFound);
+        }
         Ok(())
     }
 }

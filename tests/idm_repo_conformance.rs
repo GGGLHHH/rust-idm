@@ -7,7 +7,8 @@
 
 use idm::IdmError;
 use idm::{
-    ListPage, OutboxRepo, RoleRepo, SessionRepo, SortDir, UserListFilter, UserRepo, UserSortBy,
+    ListPage, MemberRepo, MemberStatus, OutboxRepo, RoleRepo, RoleScope, SessionRepo, SortDir,
+    TenantRepo, TenantStatus, UserListFilter, UserRepo, UserSortBy, DEFAULT_TENANT_ID,
 };
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -45,10 +46,16 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
 
     // ── role:upsert 幂等 + grant 幂等 + roles_for_user ──
     let rid = roles
-        .upsert("admin", "管理员", Some("sys".into()))
+        .upsert("admin", "管理员", RoleScope::Platform, Some("sys".into()))
         .await
         .unwrap();
-    assert_eq!(roles.upsert("admin", "管理员", None).await.unwrap(), rid); // 幂等返同 id
+    assert_eq!(
+        roles
+            .upsert("admin", "管理员", RoleScope::Platform, None)
+            .await
+            .unwrap(),
+        rid
+    ); // 幂等返同 id
     assert!(roles.roles_for_user(u.id).await.unwrap().is_empty());
     roles.grant(u.id, rid, Some("sys".into())).await.unwrap();
     roles.grant(u.id, rid, None).await.unwrap(); // 幂等:不重复授予
@@ -61,7 +68,7 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
     let now = OffsetDateTime::now_utc();
     let future = now + Duration::days(7);
     let s = sessions
-        .create(u.id, "tokhash1", future, Some("sys".into()))
+        .create(u.id, None, "tokhash1", future, Some("sys".into()))
         .await
         .unwrap();
     assert!(sessions
@@ -84,11 +91,11 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
         .is_none());
     // revoke_all:撤销该用户全部
     sessions
-        .create(u.id, "tokhash2", future, None)
+        .create(u.id, None, "tokhash2", future, None)
         .await
         .unwrap();
     sessions
-        .create(u.id, "tokhash3", future, None)
+        .create(u.id, None, "tokhash3", future, None)
         .await
         .unwrap();
     sessions.revoke_all(u.id, None).await.unwrap();
@@ -140,9 +147,18 @@ async fn idm_user_admin_contract(users: &dyn UserRepo, roles: &dyn RoleRepo) {
     };
 
     // ── 种子:3 角色 + 4 用户(经 create_with_roles,插入序 = id/created 序)──
-    let admin = roles.upsert("admin", "Admin", None).await.unwrap();
-    let editor = roles.upsert("editor", "Editor", None).await.unwrap();
-    let viewer = roles.upsert("viewer", "Viewer", None).await.unwrap();
+    let admin = roles
+        .upsert("admin", "Admin", RoleScope::Platform, None)
+        .await
+        .unwrap();
+    let editor = roles
+        .upsert("editor", "Editor", RoleScope::Platform, None)
+        .await
+        .unwrap();
+    let viewer = roles
+        .upsert("viewer", "Viewer", RoleScope::Platform, None)
+        .await
+        .unwrap();
 
     let alice = users
         .create_with_roles("alice", Some("a@x.io"), "h", &[admin], None)
@@ -419,8 +435,14 @@ async fn idm_user_admin_contract(users: &dyn UserRepo, roles: &dyn RoleRepo) {
 async fn idm_outbox_contract(users: &dyn UserRepo, roles: &dyn RoleRepo, outbox: &dyn OutboxRepo) {
     assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
 
-    let editor = roles.upsert("editor", "Editor", None).await.unwrap();
-    let viewer = roles.upsert("viewer", "Viewer", None).await.unwrap();
+    let editor = roles
+        .upsert("editor", "Editor", RoleScope::Platform, None)
+        .await
+        .unwrap();
+    let viewer = roles
+        .upsert("viewer", "Viewer", RoleScope::Platform, None)
+        .await
+        .unwrap();
 
     // ── create_with_roles → 恰一条 user.created,payload 含正确角色名 ──
     let dana = users
@@ -524,6 +546,954 @@ async fn idm_outbox_contract(users: &dyn UserRepo, roles: &dyn RoleRepo, outbox:
     assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
 }
 
+/// 多租户数据层契约(Task 1):租户 / 成员 / 租户角色 / 平台角色过滤 / 按租户吊销会话 / tenant.* 事件。
+/// 每个用例一个 async fn,内存(全部 repo 共享存储)与 PG(天然共表)各跑一遍。
+/// **两边都有默认租户**:PG 由迁移 0004 插入,内存实现构造时镜像插入 —— 断言据此写。
+mod idm_tenant_contract {
+    use super::*;
+
+    /// 一个用例要用到的全部仓储(内存侧共享存储,PG 侧共一个库)。
+    pub(crate) struct Repos {
+        pub users: Box<dyn UserRepo>,
+        pub roles: Box<dyn RoleRepo>,
+        pub sessions: Box<dyn SessionRepo>,
+        pub tenants: Box<dyn TenantRepo>,
+        pub members: Box<dyn MemberRepo>,
+        pub outbox: Box<dyn OutboxRepo>,
+    }
+
+    impl Repos {
+        fn memory() -> Self {
+            let users = idm::InMemoryUserRepo::new();
+            Self {
+                roles: Box::new(idm::InMemoryRoleRepo::sharing_with(&users)),
+                sessions: Box::new(idm::InMemorySessionRepo::sharing_with(&users)),
+                tenants: Box::new(idm::InMemoryTenantRepo::sharing_with(&users)),
+                members: Box::new(idm::InMemoryMemberRepo::sharing_with(&users)),
+                outbox: Box::new(idm::InMemoryOutboxRepo::sharing_with(&users)),
+                users: Box::new(users),
+            }
+        }
+
+        #[cfg(feature = "pg-conformance")]
+        pub(crate) fn pg(pool: sqlx::PgPool) -> Self {
+            Self {
+                users: Box::new(idm::PgUserRepo::new(pool.clone())),
+                roles: Box::new(idm::PgRoleRepo::new(pool.clone())),
+                sessions: Box::new(idm::PgSessionRepo::new(pool.clone())),
+                tenants: Box::new(idm::PgTenantRepo::new(pool.clone())),
+                members: Box::new(idm::PgMemberRepo::new(pool.clone())),
+                outbox: Box::new(idm::PgOutboxRepo::new(pool)),
+            }
+        }
+
+        /// 把发件箱里已有的行全标已发布(建用户等前置动作会 emit user.*,事件用例只看之后的)。
+        async fn drain_outbox(&self) {
+            let ids: Vec<i64> = self
+                .outbox
+                .poll_unpublished(1000)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            self.outbox.mark_published(&ids).await.unwrap();
+        }
+    }
+
+    fn tenant_ids(ms: &[idm::Membership]) -> Vec<Uuid> {
+        ms.iter().map(|m| m.tenant.id).collect()
+    }
+
+    pub(crate) async fn add_member_then_memberships_for_user_lists_it(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let bob = r.users.create("bob", None, "h", None).await.unwrap();
+        let t_admin = r
+            .roles
+            .upsert("t_admin", "租户管理员", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let acme = r
+            .tenants
+            .create("acme", "Acme", Some("sys".into()))
+            .await
+            .unwrap();
+        assert_eq!(acme.slug, "acme");
+        assert_eq!(acme.status, TenantStatus::Active);
+        assert!(acme.deleted_at.is_none());
+        assert!(r
+            .members
+            .memberships_for_user(alice.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let m = r
+            .members
+            .add(acme.id, alice.id, &[t_admin], Some("sys".into()))
+            .await
+            .unwrap();
+        assert_eq!(m.tenant.id, acme.id);
+        assert_eq!(m.user_id, alice.id);
+        assert_eq!(m.status, MemberStatus::Active);
+        assert_eq!(m.roles, vec!["t_admin".to_string()]);
+        assert!(m.last_used_at.is_none());
+
+        let ms = r.members.memberships_for_user(alice.id).await.unwrap();
+        assert_eq!(tenant_ids(&ms), vec![acme.id]);
+        assert_eq!(ms[0].tenant.slug, "acme");
+        assert_eq!(ms[0].roles, vec!["t_admin".to_string()]);
+
+        // get:成员 Some、非成员 None
+        assert!(r.members.get(acme.id, alice.id).await.unwrap().is_some());
+        assert!(r.members.get(acme.id, bob.id).await.unwrap().is_none());
+
+        // 重复加 → Conflict;不存在的租户 → NotFound;非法 role_id → NotFound(且不留半截)
+        assert!(matches!(
+            r.members.add(acme.id, alice.id, &[], None).await,
+            Err(IdmError::Conflict(_))
+        ));
+        assert!(matches!(
+            r.members.add(Uuid::now_v7(), alice.id, &[], None).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.members
+                .add(acme.id, bob.id, &[Uuid::now_v7()], None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(r.members.get(acme.id, bob.id).await.unwrap().is_none());
+
+        // list_by_tenant:只有 alice
+        let page = r
+            .members
+            .list_by_tenant(
+                acme.id,
+                &ListPage::Offset {
+                    offset: 0,
+                    limit: 10,
+                    with_total: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(1));
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].user_id, alice.id);
+
+        // 多个租户:last_used_at 最近的排最前(登录默认进它),从没用过的(NULL)排最后
+        let beta = r.tenants.create("beta", "Beta", None).await.unwrap();
+        r.members.add(beta.id, alice.id, &[], None).await.unwrap();
+        r.members.touch_last_used(beta.id, alice.id).await.unwrap();
+        let ms = r.members.memberships_for_user(alice.id).await.unwrap();
+        assert_eq!(tenant_ids(&ms), vec![beta.id, acme.id]);
+        assert!(ms[0].last_used_at.is_some());
+        assert!(ms[1].last_used_at.is_none());
+        // 非成员 touch → NotFound
+        assert!(matches!(
+            r.members.touch_last_used(beta.id, bob.id).await,
+            Err(IdmError::NotFound)
+        ));
+    }
+
+    pub(crate) async fn suspended_tenant_excluded_from_memberships(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let t1 = r.tenants.create("t1", "T1", None).await.unwrap();
+        let t2 = r.tenants.create("t2", "T2", None).await.unwrap();
+        r.members.add(t1.id, alice.id, &[], None).await.unwrap();
+        r.members.add(t2.id, alice.id, &[], None).await.unwrap();
+        let mut both = tenant_ids(&r.members.memberships_for_user(alice.id).await.unwrap());
+        both.sort();
+        assert_eq!(both, vec![t1.id, t2.id]);
+
+        let s = r
+            .tenants
+            .set_status(t1.id, TenantStatus::Suspended, None)
+            .await
+            .unwrap();
+        assert_eq!(s.status, TenantStatus::Suspended);
+        assert_eq!(
+            r.tenants.get(t1.id).await.unwrap().status,
+            TenantStatus::Suspended
+        );
+        assert_eq!(
+            tenant_ids(&r.members.memberships_for_user(alice.id).await.unwrap()),
+            vec![t2.id]
+        );
+        // 停用租户的成员关系本身还在(get 不过滤状态,由调用方判断)
+        let m = r.members.get(t1.id, alice.id).await.unwrap().unwrap();
+        assert_eq!(m.tenant.status, TenantStatus::Suspended);
+
+        // 恢复 → 又回来
+        r.tenants
+            .set_status(t1.id, TenantStatus::Active, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.members
+                .memberships_for_user(alice.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // 软删租户 → 也不在列表里;get / get_by_slug → NotFound;改它 → NotFound
+        r.tenants.soft_delete(t2.id, None).await.unwrap();
+        assert_eq!(
+            tenant_ids(&r.members.memberships_for_user(alice.id).await.unwrap()),
+            vec![t1.id]
+        );
+        assert!(matches!(
+            r.tenants.get(t2.id).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.tenants.get_by_slug("t2").await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.tenants
+                .set_status(t2.id, TenantStatus::Active, None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.tenants.soft_delete(t2.id, None).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.tenants
+                .set_status(Uuid::now_v7(), TenantStatus::Active, None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+    }
+
+    pub(crate) async fn inactive_member_excluded(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let bob = r.users.create("bob", None, "h", None).await.unwrap();
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        r.members.add(t.id, alice.id, &[], None).await.unwrap();
+        r.members.add(t.id, bob.id, &[], None).await.unwrap();
+
+        r.members
+            .set_status(t.id, alice.id, MemberStatus::Inactive, None)
+            .await
+            .unwrap();
+        assert!(r
+            .members
+            .memberships_for_user(alice.id)
+            .await
+            .unwrap()
+            .is_empty());
+        // 只影响 alice
+        assert_eq!(
+            r.members.memberships_for_user(bob.id).await.unwrap().len(),
+            1
+        );
+        // get 仍能看到(带状态),list_by_tenant 也列出(管理端要看停用成员)
+        let m = r.members.get(t.id, alice.id).await.unwrap().unwrap();
+        assert_eq!(m.status, MemberStatus::Inactive);
+        let page = r
+            .members
+            .list_by_tenant(
+                t.id,
+                &ListPage::Offset {
+                    offset: 0,
+                    limit: 10,
+                    with_total: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(2));
+
+        // 恢复
+        r.members
+            .set_status(t.id, alice.id, MemberStatus::Active, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.members
+                .memberships_for_user(alice.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // 非成员 → NotFound
+        assert!(matches!(
+            r.members
+                .set_status(Uuid::now_v7(), alice.id, MemberStatus::Inactive, None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+    }
+
+    pub(crate) async fn slug_not_reusable_after_delete(r: Repos) {
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        assert_eq!(r.tenants.get_by_slug("acme").await.unwrap().id, t.id);
+        assert!(matches!(
+            r.tenants.create("acme", "Other", None).await,
+            Err(IdmError::Conflict(_))
+        ));
+        r.tenants.soft_delete(t.id, None).await.unwrap();
+        assert!(matches!(
+            r.tenants.get_by_slug("acme").await,
+            Err(IdmError::NotFound)
+        ));
+        // 删除后 slug 仍占着:不复用
+        assert!(matches!(
+            r.tenants.create("acme", "Again", None).await,
+            Err(IdmError::Conflict(_))
+        ));
+
+        // upsert_fixed:默认租户两边都已在(PG 迁移 / 内存构造),幂等返回同一行
+        let d = r
+            .tenants
+            .upsert_fixed(DEFAULT_TENANT_ID, "default", "默认组织", None)
+            .await
+            .unwrap();
+        assert_eq!(d.id, DEFAULT_TENANT_ID);
+        assert_eq!(d.slug, "default");
+        let d2 = r
+            .tenants
+            .upsert_fixed(DEFAULT_TENANT_ID, "default", "默认组织", None)
+            .await
+            .unwrap();
+        assert_eq!(d2.id, DEFAULT_TENANT_ID);
+        // 新的固定 id:建出来;再调幂等
+        let fixed = Uuid::from_u128(0x42);
+        let f = r
+            .tenants
+            .upsert_fixed(fixed, "fixed", "Fixed", None)
+            .await
+            .unwrap();
+        assert_eq!((f.id, f.slug.as_str()), (fixed, "fixed"));
+        assert_eq!(
+            r.tenants
+                .upsert_fixed(fixed, "fixed", "Fixed", None)
+                .await
+                .unwrap()
+                .id,
+            fixed
+        );
+        // slug 被别的 id 占了 → Conflict(含已删的 acme)
+        assert!(matches!(
+            r.tenants
+                .upsert_fixed(Uuid::from_u128(0x43), "acme", "X", None)
+                .await,
+            Err(IdmError::Conflict(_))
+        ));
+
+        // update_name
+        let renamed = r.tenants.update_name(fixed, "Fixed 2", None).await.unwrap();
+        assert_eq!(renamed.name, "Fixed 2");
+        assert_eq!(renamed.slug, "fixed");
+
+        // list:只见存活(default + fixed;acme 已删),按 id 升序;cursor 翻页
+        let all = r
+            .tenants
+            .list(&ListPage::Offset {
+                offset: 0,
+                limit: 10,
+                with_total: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.total, Some(2));
+        assert_eq!(
+            all.rows.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![DEFAULT_TENANT_ID, fixed]
+        );
+        let p1 = r
+            .tenants
+            .list(&ListPage::Cursor {
+                after: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(p1.rows[0].id, DEFAULT_TENANT_ID);
+        let p2 = r
+            .tenants
+            .list(&ListPage::Cursor {
+                after: p1.next_after,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(p2.rows[0].id, fixed);
+        assert!(p2.next_after.is_none());
+    }
+
+    pub(crate) async fn roles_for_user_returns_platform_scope_only(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let sa = r
+            .roles
+            .upsert("sa", "平台管理员", RoleScope::Platform, None)
+            .await
+            .unwrap();
+        let ta = r
+            .roles
+            .upsert("ta", "租户角色", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        r.roles.grant(alice.id, sa, None).await.unwrap();
+        r.roles.grant(alice.id, ta, None).await.unwrap();
+        assert_eq!(
+            r.roles.roles_for_user(alice.id).await.unwrap(),
+            vec!["sa".to_string()]
+        );
+        // 目录带 scope
+        let list = r.roles.list().await.unwrap();
+        let scope_of = |n: &str| list.iter().find(|x| x.name == n).unwrap().scope;
+        assert_eq!(scope_of("sa"), RoleScope::Platform);
+        assert_eq!(scope_of("ta"), RoleScope::Tenant);
+
+        // 成员角色读取同样按 scope 过滤:平台角色挂进 member_roles 也不算租户角色
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        let m = r
+            .members
+            .add(t.id, alice.id, &[sa, ta], None)
+            .await
+            .unwrap();
+        assert_eq!(m.roles, vec!["ta".to_string()]);
+
+        // upsert 以调用方 scope 为准(代码闭集是真相源):同名再 upsert 成 platform → 改 scope、id 不变
+        assert_eq!(
+            r.roles
+                .upsert("ta", "租户角色", RoleScope::Platform, None)
+                .await
+                .unwrap(),
+            ta
+        );
+        let mut got = r.roles.roles_for_user(alice.id).await.unwrap();
+        got.sort();
+        assert_eq!(got, vec!["sa".to_string(), "ta".to_string()]);
+        assert!(r
+            .members
+            .get(t.id, alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .roles
+            .is_empty());
+    }
+
+    pub(crate) async fn member_roles_are_per_tenant(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let admin = r
+            .roles
+            .upsert("t_admin", "A", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let user = r
+            .roles
+            .upsert("t_user", "U", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let t1 = r.tenants.create("t1", "T1", None).await.unwrap();
+        let t2 = r.tenants.create("t2", "T2", None).await.unwrap();
+        r.members
+            .add(t1.id, alice.id, &[admin], None)
+            .await
+            .unwrap();
+        r.members.add(t2.id, alice.id, &[user], None).await.unwrap();
+
+        let roles_in = |t: Uuid| {
+            let members = &r.members;
+            let uid = alice.id;
+            async move { members.get(t, uid).await.unwrap().unwrap().roles }
+        };
+        assert_eq!(roles_in(t1.id).await, vec!["t_admin".to_string()]);
+        assert_eq!(roles_in(t2.id).await, vec!["t_user".to_string()]);
+        // 租户角色不进平台角色
+        assert!(r.roles.roles_for_user(alice.id).await.unwrap().is_empty());
+
+        // set_roles 全量替换只动 t1;结果按名排序
+        r.members
+            .set_roles(t1.id, alice.id, &[user, admin], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            roles_in(t1.id).await,
+            vec!["t_admin".to_string(), "t_user".to_string()]
+        );
+        assert_eq!(roles_in(t2.id).await, vec!["t_user".to_string()]);
+        // 幂等
+        r.members
+            .set_roles(t1.id, alice.id, &[user, admin], None)
+            .await
+            .unwrap();
+        assert_eq!(roles_in(t1.id).await.len(), 2);
+        // memberships_for_user 每个租户带各自角色
+        let ms = r.members.memberships_for_user(alice.id).await.unwrap();
+        let of = |t: Uuid| ms.iter().find(|m| m.tenant.id == t).unwrap().roles.clone();
+        assert_eq!(of(t1.id).len(), 2);
+        assert_eq!(of(t2.id), vec!["t_user".to_string()]);
+
+        // 非法 role_id → NotFound 且原角色不变;非成员 → NotFound
+        assert!(matches!(
+            r.members
+                .set_roles(t2.id, alice.id, &[Uuid::now_v7()], None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert_eq!(roles_in(t2.id).await, vec!["t_user".to_string()]);
+        assert!(matches!(
+            r.members
+                .set_roles(t2.id, Uuid::now_v7(), &[user], None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+
+        // remove:只移出 t1,连带清掉它的租户角色;再移 → NotFound
+        r.members.remove(t1.id, alice.id, None).await.unwrap();
+        assert!(r.members.get(t1.id, alice.id).await.unwrap().is_none());
+        assert_eq!(
+            tenant_ids(&r.members.memberships_for_user(alice.id).await.unwrap()),
+            vec![t2.id]
+        );
+        assert!(matches!(
+            r.members.remove(t1.id, alice.id, None).await,
+            Err(IdmError::NotFound)
+        ));
+        // 重新加入:旧角色不复活
+        r.members.add(t1.id, alice.id, &[], None).await.unwrap();
+        assert!(roles_in(t1.id).await.is_empty());
+    }
+
+    pub(crate) async fn revoke_for_member_revokes_only_that_tenant_sessions(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let bob = r.users.create("bob", None, "h", None).await.unwrap();
+        let t1 = r.tenants.create("t1", "T1", None).await.unwrap();
+        let t2 = r.tenants.create("t2", "T2", None).await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let exp = now + Duration::days(1);
+        let s1 = r
+            .sessions
+            .create(alice.id, Some(t1.id), "a-t1", exp, None)
+            .await
+            .unwrap();
+        assert_eq!(s1.tenant_id, Some(t1.id));
+        r.sessions
+            .create(alice.id, Some(t2.id), "a-t2", exp, None)
+            .await
+            .unwrap();
+        r.sessions
+            .create(alice.id, None, "a-platform", exp, None)
+            .await
+            .unwrap();
+        r.sessions
+            .create(bob.id, Some(t1.id), "b-t1", exp, None)
+            .await
+            .unwrap();
+
+        let active = |h: &'static str| {
+            let sessions = &r.sessions;
+            async move { sessions.find_active(h, now).await.unwrap() }
+        };
+        // find_active 带回 tenant_id(平台上下文 = None)
+        assert_eq!(active("a-t2").await.unwrap().tenant_id, Some(t2.id));
+        assert_eq!(active("a-platform").await.unwrap().tenant_id, None);
+
+        r.sessions.revoke_for_member(t1.id, alice.id).await.unwrap();
+        assert!(active("a-t1").await.is_none());
+        assert!(active("a-t2").await.is_some());
+        assert!(active("a-platform").await.is_some());
+        assert!(active("b-t1").await.is_some());
+
+        r.sessions.revoke_for_tenant(t2.id).await.unwrap();
+        assert!(active("a-t2").await.is_none());
+        assert!(active("a-platform").await.is_some());
+        assert!(active("b-t1").await.is_some());
+        r.sessions.revoke_for_tenant(t1.id).await.unwrap();
+        assert!(active("b-t1").await.is_none());
+        assert!(active("a-platform").await.is_some());
+        // 幂等
+        r.sessions.revoke_for_tenant(t1.id).await.unwrap();
+        r.sessions.revoke_for_member(t1.id, alice.id).await.unwrap();
+    }
+
+    pub(crate) async fn member_ops_emit_outbox_events(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let admin = r
+            .roles
+            .upsert("t_admin", "A", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let user = r
+            .roles
+            .upsert("t_user", "U", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        r.drain_outbox().await;
+
+        // 取出全部未发布事件并标已发布,断言每条的 aggregate_id 都是租户、payload 带 tenant_id
+        let take = |tid: Uuid| {
+            let outbox = &r.outbox;
+            async move {
+                let rows = outbox.poll_unpublished(100).await.unwrap();
+                let ids: Vec<i64> = rows.iter().map(|x| x.id).collect();
+                outbox.mark_published(&ids).await.unwrap();
+                for row in &rows {
+                    assert_eq!(
+                        row.aggregate_id, tid,
+                        "{} 的 aggregate 应是租户",
+                        row.event_type
+                    );
+                    assert_eq!(
+                        row.payload["tenant_id"],
+                        serde_json::to_value(tid).unwrap(),
+                        "{} payload 应带 tenant_id",
+                        row.event_type
+                    );
+                }
+                rows
+            }
+        };
+        let types = |rows: &[idm::OutboxRecord]| {
+            rows.iter()
+                .map(|x| x.event_type.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.created"]);
+        assert_eq!(rows[0].payload["slug"], "acme");
+        assert_eq!(rows[0].payload["name"], "Acme");
+        assert_eq!(rows[0].payload["status"], "active");
+
+        r.tenants.update_name(t.id, "Acme 2", None).await.unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.updated"]);
+        assert_eq!(rows[0].payload["name"], "Acme 2");
+        assert_eq!(rows[0].payload["status"], "active");
+
+        r.tenants
+            .set_status(t.id, TenantStatus::Suspended, None)
+            .await
+            .unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.updated"]);
+        assert_eq!(rows[0].payload["status"], "suspended");
+
+        r.members.add(t.id, alice.id, &[admin], None).await.unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.member_added"]);
+        assert_eq!(
+            rows[0].payload["user_id"],
+            serde_json::to_value(alice.id).unwrap()
+        );
+        assert_eq!(rows[0].payload["roles"], serde_json::json!(["t_admin"]));
+        assert_eq!(rows[0].payload["status"], "active");
+
+        r.members
+            .set_roles(t.id, alice.id, &[user, admin], None)
+            .await
+            .unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.member_roles_set"]);
+        assert_eq!(
+            rows[0].payload["roles"],
+            serde_json::json!(["t_admin", "t_user"])
+        );
+
+        r.members
+            .set_status(t.id, alice.id, MemberStatus::Inactive, None)
+            .await
+            .unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.member_updated"]);
+        assert_eq!(rows[0].payload["status"], "inactive");
+
+        // touch_last_used / upsert_fixed 命中已有 / 失败的写 → 不发事件
+        r.members.touch_last_used(t.id, alice.id).await.unwrap();
+        assert!(r.members.add(t.id, alice.id, &[], None).await.is_err());
+        assert!(r
+            .members
+            .set_roles(t.id, alice.id, &[Uuid::now_v7()], None)
+            .await
+            .is_err());
+        assert!(r.tenants.create("acme", "dup", None).await.is_err());
+        assert!(take(t.id).await.is_empty());
+        r.tenants
+            .upsert_fixed(DEFAULT_TENANT_ID, "default", "默认组织", None)
+            .await
+            .unwrap();
+        assert!(take(DEFAULT_TENANT_ID).await.is_empty());
+
+        r.members.remove(t.id, alice.id, None).await.unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.member_removed"]);
+        assert_eq!(
+            rows[0].payload["user_id"],
+            serde_json::to_value(alice.id).unwrap()
+        );
+
+        r.tenants.soft_delete(t.id, None).await.unwrap();
+        let rows = take(t.id).await;
+        assert_eq!(types(&rows), ["tenant.deleted"]);
+    }
+
+    /// 注册原子单元(Task 2):`UserRepo::create_with_membership` 一个事务建账号 + 加入租户 + 授租户角色。
+    /// 租户不存在 / 停用 / 已删 → 只建账号;任一步失败(角色不存在、用户名冲突)→ 什么都不留。
+    pub(crate) async fn create_with_membership_is_atomic(r: Repos) {
+        let t_user = r
+            .roles
+            .upsert("t_user", "成员", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        r.drain_outbox().await;
+
+        let alice = r
+            .users
+            .create_with_membership(
+                "alice",
+                Some("a@x.com"),
+                "h",
+                DEFAULT_TENANT_ID,
+                &[t_user],
+                Some("sys".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alice.username, "alice");
+        let ms = r.members.memberships_for_user(alice.id).await.unwrap();
+        assert_eq!(tenant_ids(&ms), vec![DEFAULT_TENANT_ID]);
+        assert_eq!(ms[0].roles, vec!["t_user".to_string()]);
+        assert_eq!(ms[0].status, MemberStatus::Active);
+        // 事件:user.created 在前,tenant.member_added 在后(同一事务)
+        let rows = r.outbox.poll_unpublished(100).await.unwrap();
+        let types: Vec<&str> = rows.iter().map(|x| x.event_type.as_str()).collect();
+        assert_eq!(types, ["user.created", "tenant.member_added"]);
+        assert_eq!(rows[1].aggregate_id, DEFAULT_TENANT_ID);
+        assert_eq!(rows[1].payload["roles"], serde_json::json!(["t_user"]));
+        r.drain_outbox().await;
+
+        // 停用的租户 → 只建账号,不加入,只发 user.created
+        let acme = r.tenants.create("acme", "Acme", None).await.unwrap();
+        r.tenants
+            .set_status(acme.id, TenantStatus::Suspended, None)
+            .await
+            .unwrap();
+        r.drain_outbox().await;
+        let bob = r
+            .users
+            .create_with_membership("bob", None, "h", acme.id, &[t_user], None)
+            .await
+            .unwrap();
+        assert!(r.members.get(acme.id, bob.id).await.unwrap().is_none());
+        let rows = r.outbox.poll_unpublished(100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "user.created");
+        r.drain_outbox().await;
+
+        // 不存在 / 已删的租户 → 只建账号
+        let carol = r
+            .users
+            .create_with_membership("carol", None, "h", Uuid::now_v7(), &[t_user], None)
+            .await
+            .unwrap();
+        assert!(r
+            .members
+            .memberships_for_user(carol.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let gone = r.tenants.create("gone", "Gone", None).await.unwrap();
+        r.tenants.soft_delete(gone.id, None).await.unwrap();
+        let dave = r
+            .users
+            .create_with_membership("dave", None, "h", gone.id, &[], None)
+            .await
+            .unwrap();
+        assert!(r
+            .members
+            .memberships_for_user(dave.id)
+            .await
+            .unwrap()
+            .is_empty());
+        r.drain_outbox().await;
+
+        // 角色不存在 → NotFound,账号也不留、不发事件
+        assert!(matches!(
+            r.users
+                .create_with_membership(
+                    "erin",
+                    None,
+                    "h",
+                    DEFAULT_TENANT_ID,
+                    &[Uuid::now_v7()],
+                    None
+                )
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(r.users.find_by_identifier("erin").await.unwrap().is_none());
+        // 用户名冲突 → Conflict,不留成员关系
+        assert!(matches!(
+            r.users
+                .create_with_membership("alice", None, "h", DEFAULT_TENANT_ID, &[t_user], None)
+                .await,
+            Err(IdmError::Conflict(_))
+        ));
+        assert!(r.outbox.poll_unpublished(100).await.unwrap().is_empty());
+        let page = r
+            .members
+            .list_by_tenant(
+                DEFAULT_TENANT_ID,
+                &ListPage::Offset {
+                    offset: 0,
+                    limit: 10,
+                    with_total: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(1)); // 只有 alice
+    }
+
+    /// 会话的租户须存在(PG 靠外键,内存共享租户存储校验):不存在 → NotFound;已删的租户行仍在,外键不拦。
+    pub(crate) async fn session_create_rejects_unknown_tenant(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let future = OffsetDateTime::now_utc() + Duration::days(1);
+        assert!(matches!(
+            r.sessions
+                .create(alice.id, Some(Uuid::now_v7()), "h-unknown", future, None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(r
+            .sessions
+            .find_active("h-unknown", OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_none());
+        let s = r
+            .sessions
+            .create(alice.id, Some(DEFAULT_TENANT_ID), "h-default", future, None)
+            .await
+            .unwrap();
+        assert_eq!(s.tenant_id, Some(DEFAULT_TENANT_ID));
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        let s = r
+            .sessions
+            .create(alice.id, Some(t.id), "h-acme", future, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.sessions
+                .find_active("h-acme", OffsetDateTime::now_utc())
+                .await
+                .unwrap()
+                .map(|x| x.tenant_id),
+            Some(Some(t.id))
+        );
+        assert_eq!(s.tenant_id, Some(t.id));
+        r.tenants.soft_delete(t.id, None).await.unwrap();
+        assert!(r
+            .sessions
+            .create(alice.id, Some(t.id), "h-deleted", future, None)
+            .await
+            .is_ok());
+    }
+
+    /// 租户软删后,对其成员关系的写(set_status / set_roles / touch_last_used / remove)一律 NotFound,
+    /// 不改数据、不发事件(和 get / list 看不见已删租户的成员一致)。
+    pub(crate) async fn member_writes_on_deleted_tenant_are_not_found(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let role = r
+            .roles
+            .upsert("t_user", "成员", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+        r.members.add(t.id, alice.id, &[role], None).await.unwrap();
+        r.tenants.soft_delete(t.id, None).await.unwrap();
+        r.drain_outbox().await;
+
+        assert!(matches!(
+            r.members
+                .set_status(t.id, alice.id, MemberStatus::Inactive, None)
+                .await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.members.set_roles(t.id, alice.id, &[], None).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.members.touch_last_used(t.id, alice.id).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(matches!(
+            r.members.remove(t.id, alice.id, None).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(r.outbox.poll_unpublished(100).await.unwrap().is_empty());
+        // 存活租户上的同样操作照常(对照:证明 NotFound 是因为租户已删)
+        let t2 = r.tenants.create("beta", "Beta", None).await.unwrap();
+        r.members.add(t2.id, alice.id, &[role], None).await.unwrap();
+        r.members
+            .set_roles(t2.id, alice.id, &[], None)
+            .await
+            .unwrap();
+        r.members.touch_last_used(t2.id, alice.id).await.unwrap();
+        r.members
+            .set_status(t2.id, alice.id, MemberStatus::Inactive, None)
+            .await
+            .unwrap();
+        r.members.remove(t2.id, alice.id, None).await.unwrap();
+    }
+
+    /// 同一批用例生成内存入口(默认 cargo test)和 PG 入口(pg-conformance)。
+    macro_rules! both_backends {
+        ($($case:ident),* $(,)?) => {
+            mod memory {
+                $(
+                    #[tokio::test]
+                    async fn $case() {
+                        super::$case(super::Repos::memory()).await;
+                    }
+                )*
+            }
+
+            #[cfg(feature = "pg-conformance")]
+            mod pg {
+                $(
+                    #[sqlx::test(migrations = false)]
+                    async fn $case(pool: sqlx::PgPool) -> sqlx::Result<()> {
+                        crate::pg::bootstrap_idm(&pool)
+                            .await
+                            .expect("bootstrap idm schema + 跑 migrations");
+                        super::$case(super::Repos::pg(pool)).await;
+                        Ok(())
+                    }
+                )*
+            }
+        };
+    }
+
+    both_backends!(
+        add_member_then_memberships_for_user_lists_it,
+        suspended_tenant_excluded_from_memberships,
+        inactive_member_excluded,
+        slug_not_reusable_after_delete,
+        roles_for_user_returns_platform_scope_only,
+        member_roles_are_per_tenant,
+        revoke_for_member_revokes_only_that_tenant_sessions,
+        member_ops_emit_outbox_events,
+        create_with_membership_is_atomic,
+        session_create_rejects_unknown_tenant,
+        member_writes_on_deleted_tenant_are_not_found,
+    );
+}
+
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
 #[tokio::test]
 async fn memory_satisfies_idm_contract() {
@@ -568,7 +1538,7 @@ mod pg {
     static IDM_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
     /// #[sqlx::test] 的干净临时库:建 idm schema + 跑 idm crate 自带 migrations。
-    async fn bootstrap_idm(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    pub(crate) async fn bootstrap_idm(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         sqlx::query("create schema if not exists idm")
             .execute(pool)
             .await?;
@@ -608,6 +1578,124 @@ mod pg {
         let roles = idm::PgRoleRepo::new(pool.clone());
         let outbox = idm::PgOutboxRepo::new(pool);
         super::idm_outbox_contract(&users, &roles, &outbox).await;
+        Ok(())
+    }
+
+    /// 迁移 0004 回填:在只跑到 0003 的库里塞两个存活用户 + 一个软删用户和 user_roles,再跑 0004 ——
+    /// 两个存活用户都成为默认租户 active 成员,user_roles 复制进默认租户的 member_roles(原行保留);
+    /// superadmin 改为平台角色并在默认租户兼任 admin(spec §4.7);软删用户不加;
+    /// 有效会话(账号是默认租户成员)回填默认租户,已吊销 / 非成员的会话保持 NULL。
+    #[sqlx::test(migrations = false)]
+    async fn migration_backfills_default_tenant(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        use super::Uuid;
+        use idm::{MemberRepo, RoleRepo, DEFAULT_TENANT_ID};
+
+        sqlx::query("create schema if not exists idm")
+            .execute(&pool)
+            .await?;
+        IDM_MIGRATOR.run_to(3, &pool).await.expect("跑到 0003");
+
+        let (u1, u2, gone) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        for (id, name) in [(u1, "u1"), (u2, "u2"), (gone, "gone")] {
+            sqlx::query("insert into users (id, username) values ($1, $2)")
+                .bind(id)
+                .bind(name)
+                .execute(&pool)
+                .await?;
+        }
+        sqlx::query("update users set deleted_at = now() where id = $1")
+            .bind(gone)
+            .execute(&pool)
+            .await?;
+        let (r_sa, r_admin, r_user) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        for (id, name) in [(r_sa, "superadmin"), (r_admin, "admin"), (r_user, "user")] {
+            sqlx::query("insert into roles (id, name, display_name) values ($1, $2, $2)")
+                .bind(id)
+                .bind(name)
+                .execute(&pool)
+                .await?;
+        }
+        for (u, r) in [(u1, r_sa), (u2, r_user), (u2, r_admin), (gone, r_user)] {
+            sqlx::query("insert into user_roles (user_id, role_id) values ($1, $2)")
+                .bind(u)
+                .bind(r)
+                .execute(&pool)
+                .await?;
+        }
+
+        // 升级前的会话:u1 有效、u2 已吊销、软删用户 gone 的有效会话(不是成员)
+        let (s_live, s_revoked, s_gone) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        for (sid, uid, revoked) in [
+            (s_live, u1, false),
+            (s_revoked, u2, true),
+            (s_gone, gone, false),
+        ] {
+            sqlx::query(
+                "insert into sessions (id, user_id, token_hash, expires_at, revoked_at)
+                 values ($1, $2, $3, now() + interval '1 day',
+                         case when $4 then now() else null end)",
+            )
+            .bind(sid)
+            .bind(uid)
+            .bind(sid.to_string())
+            .bind(revoked)
+            .execute(&pool)
+            .await?;
+        }
+
+        IDM_MIGRATOR.run(&pool).await.expect("跑 0004");
+
+        // 有效会话且仍是默认租户成员 → 回填默认租户;已吊销 / 非成员的保持 NULL
+        let sess: Vec<(Uuid, Option<Uuid>)> =
+            sqlx::query_as("select id, tenant_id from sessions order by id")
+                .fetch_all(&pool)
+                .await?;
+        let mut expect = vec![
+            (s_live, Some(DEFAULT_TENANT_ID)),
+            (s_revoked, None),
+            (s_gone, None),
+        ];
+        expect.sort();
+        assert_eq!(sess, expect);
+
+        // 两个存活用户都是默认租户的 active 成员;软删的不加
+        let members: Vec<(Uuid, String)> = sqlx::query_as(
+            "select user_id, status from tenant_members where tenant_id = $1 order by user_id",
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .fetch_all(&pool)
+        .await?;
+        let mut expect = vec![(u1, "active".to_owned()), (u2, "active".to_owned())];
+        expect.sort();
+        assert_eq!(members, expect);
+
+        // member_roles:u2 的 admin/user 原样复制;u1 的 superadmin 复制 + 兼任 admin
+        let mr: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "select user_id, role_id from member_roles where tenant_id = $1 order by user_id, role_id",
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .fetch_all(&pool)
+        .await?;
+        let mut expect = vec![(u1, r_sa), (u1, r_admin), (u2, r_admin), (u2, r_user)];
+        expect.sort();
+        assert_eq!(mr, expect);
+        // user_roles 原行保留(复制不是搬)
+        let ur: i64 = sqlx::query_scalar("select count(*) from user_roles")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(ur, 4);
+
+        // 经仓储读:平台角色只剩 superadmin;默认租户的租户角色按 scope 过滤
+        let roles = idm::PgRoleRepo::new(pool.clone());
+        assert_eq!(roles.roles_for_user(u1).await.unwrap(), vec!["superadmin"]);
+        let members = idm::PgMemberRepo::new(pool.clone());
+        let m1 = members.memberships_for_user(u1).await.unwrap();
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].tenant.id, DEFAULT_TENANT_ID);
+        assert_eq!(m1[0].tenant.slug, "default");
+        assert_eq!(m1[0].roles, vec!["admin"]);
+        let m2 = members.memberships_for_user(u2).await.unwrap();
+        assert_eq!(m2[0].roles, vec!["admin", "user"]);
         Ok(())
     }
 

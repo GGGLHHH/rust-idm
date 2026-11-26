@@ -1,7 +1,7 @@
 //! access token 编解码端口 + refresh token 原语。
 //!
 //! **签发(claim 形状 + 签名算法/密钥)与验证全部可拔插**:idm 只提供身份事实(`TokenClaims`)、
-//! 只回读核心身份(`VerifiedToken`)—— app 可注入自定义 claims(tenant_id/权限位…)、RS256/EdDSA、
+//! 只回读核心身份(`VerifiedToken`,含当前租户与租户角色)—— app 可注入自定义 claims(tenant_id/权限位…)、RS256/EdDSA、
 //! KMS/HSM 签名。一个端口同时解决"claim 里放什么"与"怎么签",二者本是同一处决定。
 //!
 //! **分进程最小权限**:签验拆成两个 trait —— idm 进程持 [`TokenSigner`](私钥/签发),app 进程只注入
@@ -23,7 +23,16 @@ pub struct TokenClaims {
     pub username: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    /// **平台角色**(含义从"全部角色"收窄为"平台角色";租户角色见 `tenant_roles`)。
     pub roles: Vec<String>,
+    /// 当前租户;`None` = 平台上下文(token 里缺省该 claim)。
+    pub tenant_id: Option<Uuid>,
+    /// 当前租户内的角色。
+    pub tenant_roles: Vec<String>,
+    /// 当前租户的 slug / 名称(给前端展示「当前组织」用;app 进程只验 JWT、不查 idm 库,只能从 token 里拿)。
+    /// 平台上下文 → `None`。默认 `Hs256Tokens` 不写进 token;要不要写由 signer 决定。
+    pub tenant_slug: Option<String>,
+    pub tenant_name: Option<String>,
     pub issued_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }
@@ -32,7 +41,12 @@ pub struct TokenClaims {
 pub struct VerifiedToken {
     pub user_id: Uuid,
     pub username: String,
+    /// 平台角色。
     pub roles: Vec<String>,
+    /// 当前租户;旧 token / 平台上下文 → `None`。
+    pub tenant_id: Option<Uuid>,
+    /// 当前租户内的角色;旧 token → 空。
+    pub tenant_roles: Vec<String>,
 }
 
 /// 签发端口(idm 进程):把身份事实签成 access token。实现决定 claim 形状 + 算法 + 密钥源。
@@ -61,7 +75,7 @@ impl Hs256Tokens {
     }
 }
 
-/// HS256 的内部 claim 形状(序列化进 token)。`#[serde(default)]` roles:旧 token(无 roles)解码不失败。
+/// HS256 的内部 claim 形状(序列化进 token)。`#[serde(default)]`:旧 token(无 roles / 无租户 claim)解码不失败。
 #[derive(Serialize, Deserialize)]
 struct Hs256Claims {
     sub: String,
@@ -71,6 +85,11 @@ struct Hs256Claims {
     email_verified: bool,
     #[serde(default)]
     roles: Vec<String>,
+    /// 当前租户;平台上下文时**缺省**(不写 null)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<Uuid>,
+    #[serde(default)]
+    tenant_roles: Vec<String>,
     iat: i64,
     exp: i64,
 }
@@ -84,6 +103,8 @@ impl TokenSigner for Hs256Tokens {
             email: c.email.clone(),
             email_verified: c.email_verified,
             roles: c.roles.clone(),
+            tenant_id: c.tenant_id,
+            tenant_roles: c.tenant_roles.clone(),
             iat: c.issued_at.unix_timestamp(),
             exp: c.expires_at.unix_timestamp(),
         };
@@ -106,6 +127,8 @@ impl TokenVerifier for Hs256Tokens {
             user_id,
             username: claims.username,
             roles: claims.roles,
+            tenant_id: claims.tenant_id,
+            tenant_roles: claims.tenant_roles,
         })
     }
 }
@@ -139,6 +162,10 @@ mod tests {
             email: None,
             email_verified: false,
             roles: vec!["admin".into()],
+            tenant_id: None,
+            tenant_roles: vec![],
+            tenant_slug: None,
+            tenant_name: None,
             issued_at: OffsetDateTime::now_utc(),
             expires_at,
         }
@@ -187,5 +214,69 @@ mod tests {
             signer.verify("garbage"),
             Err(IdmError::Unauthorized)
         ));
+    }
+    /// 旧 token(Task 2 之前签的,没有 tenant_id / tenant_roles)仍能验过:租户字段缺省为 None / 空。
+    #[test]
+    fn old_token_without_tenant_claims_still_verifies() {
+        #[derive(Serialize)]
+        struct OldClaims {
+            sub: String,
+            jti: String,
+            username: String,
+            email: Option<String>,
+            email_verified: bool,
+            roles: Vec<String>,
+            iat: i64,
+            exp: i64,
+        }
+        let now = OffsetDateTime::now_utc();
+        let old = OldClaims {
+            sub: Uuid::from_u128(1).to_string(),
+            jti: Uuid::from_u128(2).to_string(),
+            username: "alice".into(),
+            email: None,
+            email_verified: false,
+            roles: vec!["superadmin".into()],
+            iat: now.unix_timestamp(),
+            exp: (now + Duration::hours(1)).unix_timestamp(),
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &old,
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        let v = Hs256Tokens::new("secret").verify(&token).unwrap();
+        assert_eq!(v.user_id, Uuid::from_u128(1));
+        assert_eq!(v.roles, vec!["superadmin".to_string()]);
+        assert_eq!(v.tenant_id, None);
+        assert!(v.tenant_roles.is_empty());
+    }
+
+    /// 新 claim 往返:tenant_id / tenant_roles 完整穿越;平台上下文(None)不写 tenant_id 字段。
+    #[test]
+    fn tenant_claims_round_trip() {
+        let t = Hs256Tokens::new("secret");
+        let mut c = sample(
+            Uuid::from_u128(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        );
+        c.tenant_id = Some(Uuid::from_u128(9));
+        c.tenant_roles = vec!["admin".into()];
+        let v = t.verify(&t.sign(&c).unwrap()).unwrap();
+        assert_eq!(v.tenant_id, Some(Uuid::from_u128(9)));
+        assert_eq!(v.tenant_roles, vec!["admin".to_string()]);
+
+        c.tenant_id = None;
+        c.tenant_roles = vec![];
+        let token = t.sign(&c).unwrap();
+        let payload = token.split('.').nth(1).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(
+            json.get("tenant_id").is_none(),
+            "平台上下文缺省 tenant_id: {json}"
+        );
+        assert_eq!(t.verify(&token).unwrap().tenant_id, None);
     }
 }
