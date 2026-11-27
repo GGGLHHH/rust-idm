@@ -22,7 +22,7 @@ use super::{
 use crate::error::IdmError;
 use crate::tenant::{MemberStatus, Membership, RoleScope, Tenant, TenantStatus};
 
-/// EXISTS/NOT EXISTS 子查询:该 user 拥有名在 `names` 里的存活角色。相关子查询(引用外层 `users.id`)。
+/// EXISTS/NOT EXISTS 子查询:该 user 拥有名在 `names` 里的存活**平台**角色。相关子查询(引用外层 `users.id`)。
 fn user_has_role_subquery(names: &[String]) -> SelectStatement {
     let mut sub = Query::select();
     sub.expr(Expr::val(1))
@@ -35,6 +35,9 @@ fn user_has_role_subquery(names: &[String]) -> SelectStatement {
             Expr::col((UserRoles::Table, UserRoles::UserId)).equals((Users::Table, Users::Id)),
         )
         .and_where(Expr::col((Roles::Table, Roles::DeletedAt)).is_null())
+        // 只看平台角色:迁移 0004 把 user_roles **复制**进默认租户后,老账号的 user_roles 里还留着
+        // 租户作用域的行(admin / user),它们不是平台角色,不能被平台账号列表的角色筛选命中。
+        .and_where(Expr::col((Roles::Table, Roles::Scope)).eq("platform"))
         .and_where(Expr::col((Roles::Table, Roles::Name)).is_in(names.iter().cloned()));
     sub
 }
@@ -551,11 +554,13 @@ impl UserRepo for PgUserRepo {
             .column((Users::Table, Users::Email))
             .column((Users::Table, Users::EmailVerified))
             .column((Users::Table, Users::CreatedAt))
-            // roles 列:相关子查询聚合成 text[](按名排序,parity with 内存)。
+            // roles 列:相关子查询聚合成 text[](按名排序,parity with 内存)。只取平台角色
+            // (user_roles 里迁移残留的租户作用域行不显示,同 user_has_role_subquery)。
             .expr_as(
                 Expr::cust(
                     "array(SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
-                     WHERE ur.user_id = users.id AND r.deleted_at IS NULL ORDER BY r.name COLLATE \"C\")",
+                     WHERE ur.user_id = users.id AND r.deleted_at IS NULL AND r.scope = 'platform' \
+                     ORDER BY r.name COLLATE \"C\")",
                 ),
                 Alias::new("roles"),
             )
@@ -703,18 +708,19 @@ impl SessionRepo for PgSessionRepo {
     }
 
     #[tracing::instrument(name = "pg.sessions.revoke", skip_all)]
-    async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError> {
+    async fn revoke(&self, session_id: Uuid) -> Result<bool, IdmError> {
+        // 条件更新(WHERE revoked_at IS NULL):并发撤同一会话时行锁串行,只有一个能更新到 1 行。
         let (sql, values) = Query::update()
             .table(Sessions::Table)
             .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
             .and_where(Expr::col(Sessions::Id).eq(session_id))
             .and_where(Expr::col(Sessions::RevokedAt).is_null())
             .build_sqlx(PostgresQueryBuilder);
-        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+        let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
             .map_err(|e| IdmError::Internal(e.into()))?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     #[tracing::instrument(name = "pg.sessions.revoke_all", skip_all)]
@@ -1257,6 +1263,14 @@ where t.deleted_at is null"#
     };
 }
 
+/// 成员列表(及其计数)的附加条件:账号未软删 —— 注销的账号不再出现在成员列表和 total 里。
+/// 宏:同 `membership_select!`,要在 `concat!` 里拼 'static SQL。
+macro_rules! member_user_alive {
+    () => {
+        "exists (select 1 from users u where u.id = m.user_id and u.deleted_at is null)"
+    };
+}
+
 #[derive(sqlx::FromRow)]
 struct MembershipRow {
     #[sqlx(flatten)]
@@ -1374,6 +1388,17 @@ impl MemberRepo for PgMemberRepo {
         .await
         .map_err(internal)?;
         if alive.is_none() {
+            return Err(IdmError::NotFound);
+        }
+        // 用户须存活(FOR SHARE:挡住同时进行的软删)。外键只拦"行不存在",软删的行还在,得自己查。
+        let user_alive: Option<i32> = sqlx::query_scalar(
+            "select 1 from users where id = $1 and deleted_at is null for share",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if user_alive.is_none() {
             return Err(IdmError::NotFound);
         }
         let (sql, values) = Query::insert()
@@ -1543,7 +1568,9 @@ impl MemberRepo for PgMemberRepo {
             } => {
                 const SQL: &str = concat!(
                     membership_select!(),
-                    " and m.tenant_id = $1 order by m.user_id limit $2 offset $3"
+                    " and m.tenant_id = $1 and ",
+                    member_user_alive!(),
+                    " order by m.user_id limit $2 offset $3"
                 );
                 let rows = sqlx::query_as::<Postgres, MembershipRow>(SQL)
                     .bind(tenant_id)
@@ -1553,14 +1580,16 @@ impl MemberRepo for PgMemberRepo {
                     .await
                     .map_err(internal)?;
                 let total = if with_total {
-                    let n: i64 = sqlx::query_scalar(
+                    const COUNT: &str = concat!(
                         "select count(*) from tenant_members m join tenants t on t.id = m.tenant_id \
-                         where t.deleted_at is null and m.tenant_id = $1",
-                    )
-                    .bind(tenant_id)
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(internal)?;
+                         where t.deleted_at is null and m.tenant_id = $1 and ",
+                        member_user_alive!()
+                    );
+                    let n: i64 = sqlx::query_scalar(COUNT)
+                        .bind(tenant_id)
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(internal)?;
                     Some(n as u64)
                 } else {
                     None
@@ -1575,7 +1604,9 @@ impl MemberRepo for PgMemberRepo {
                 // after 为空时用 nil UUID 作下界(user_id 不会是 nil)
                 const SQL: &str = concat!(
                     membership_select!(),
-                    " and m.tenant_id = $1 and m.user_id > $2 order by m.user_id limit $3"
+                    " and m.tenant_id = $1 and m.user_id > $2 and ",
+                    member_user_alive!(),
+                    " order by m.user_id limit $3"
                 );
                 let rows = sqlx::query_as::<Postgres, MembershipRow>(SQL)
                     .bind(tenant_id)

@@ -330,7 +330,8 @@ pub trait UserRepo: Send + Sync {
 
     /// admin 列表:过滤(username 模糊 / roles_any / roles_none / created 区间)+ 排序
     /// (`sort_by`×`dir`,email `NULLS LAST`,id 兜底)+ 分页(offset+可选总数 或 cursor keyset)。
-    /// **只见存活用户**;`roles` 列 = 该用户存活角色名(按名排序)。
+    /// **只见存活用户**;`roles` 列 = 该用户存活的**平台**角色名(按名排序);`roles_any` / `roles_none`
+    /// 也只按平台角色判定。`user_roles` 里租户作用域的行(迁移 0004 复制进默认租户后的残留)一概不看。
     async fn list(
         &self,
         filter: &UserListFilter,
@@ -387,8 +388,10 @@ pub trait SessionRepo: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<Session>, IdmError>;
 
-    /// 撤销会话(盖 revoked_at)。幂等(已撤销/不存在都 Ok)。
-    async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError>;
+    /// 撤销会话(盖 revoked_at)。**条件更新**(只动未撤销的行):真撤掉了一行 → `true`;
+    /// 已撤销 / 不存在 → `false`(幂等,不报错)。并发撤同一会话只有一个调用方拿到 `true` ——
+    /// refresh / 切换租户靠它做轮换闸:拿到 `false` 说明这个 refresh token 已被别人用掉,不能再签新会话。
+    async fn revoke(&self, session_id: Uuid) -> Result<bool, IdmError>;
 
     /// 撤销用户的所有活跃会话;`except` 排除某会话(改密保留当前)。
     async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError>;
@@ -486,7 +489,7 @@ pub trait TenantRepo: Send + Sync {
 /// `Membership.roles` 只含**存活、scope = tenant** 的角色名(按名排序);写入时只校验角色存在,不校验 scope。
 #[async_trait]
 pub trait MemberRepo: Send + Sync {
-    /// 加成员(status = active)并授租户角色。租户不存在 / 已软删、用户不存在、任一 role_id 不存在
+    /// 加成员(status = active)并授租户角色。租户不存在 / 已软删、用户不存在 / 已软删、任一 role_id 不存在
     /// → `NotFound`;已是成员(任何状态)→ `Conflict`。任一步失败整体回滚。
     async fn add(
         &self,
@@ -526,7 +529,7 @@ pub trait MemberRepo: Send + Sync {
     /// 查成员关系(**任何状态**,租户停用也照样返回,由调用方判断)。不是成员 / 租户已软删 → `None`。
     async fn get(&self, tenant_id: Uuid, user_id: Uuid) -> Result<Option<Membership>, IdmError>;
 
-    /// 某租户的成员列表(任何状态),按 user_id 升序;`Cursor` 的 `after` 是上一页最后一个 user_id。
+    /// 某租户的成员列表(任何状态;**不含已软删账号**,total 同口径),按 user_id 升序;`Cursor` 的 `after` 是上一页最后一个 user_id。
     async fn list_by_tenant(
         &self,
         tenant_id: Uuid,

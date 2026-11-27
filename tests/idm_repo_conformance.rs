@@ -1451,6 +1451,161 @@ mod idm_tenant_contract {
         r.members.remove(t2.id, alice.id, None).await.unwrap();
     }
 
+    /// 复审 #1:`MemberRepo::add` 对已软删账号 → `NotFound`(trait 文档「用户不存在」),不留成员行、不发事件;
+    /// 账号软删后,成员列表(offset / cursor)和 total 都不再含他。
+    pub(crate) async fn soft_deleted_user_not_addable_nor_listed_as_member(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let bob = r.users.create("bob", None, "h", None).await.unwrap();
+        let carol = r.users.create("carol", None, "h", None).await.unwrap();
+        let t = r.tenants.create("acme", "Acme", None).await.unwrap();
+
+        // carol 先软删,再加 → NotFound,且看不到半截成员行
+        r.users.soft_delete(carol.id, None).await.unwrap();
+        r.drain_outbox().await;
+        assert!(matches!(
+            r.members.add(t.id, carol.id, &[], None).await,
+            Err(IdmError::NotFound)
+        ));
+        assert!(r.members.get(t.id, carol.id).await.unwrap().is_none());
+        assert!(r.outbox.poll_unpublished(100).await.unwrap().is_empty());
+
+        // alice、bob 都是成员;bob 之后软删 → 列表与 total 只剩 alice
+        r.members.add(t.id, alice.id, &[], None).await.unwrap();
+        r.members.add(t.id, bob.id, &[], None).await.unwrap();
+        let offset = ListPage::Offset {
+            offset: 0,
+            limit: 10,
+            with_total: true,
+        };
+        assert_eq!(
+            r.members.list_by_tenant(t.id, &offset).await.unwrap().total,
+            Some(2)
+        );
+        r.users.soft_delete(bob.id, None).await.unwrap();
+        let page = r.members.list_by_tenant(t.id, &offset).await.unwrap();
+        assert_eq!(page.total, Some(1));
+        let ids: Vec<Uuid> = page.rows.iter().map(|m| m.user_id).collect();
+        assert_eq!(ids, vec![alice.id]);
+        let cursor = r
+            .members
+            .list_by_tenant(
+                t.id,
+                &ListPage::Cursor {
+                    after: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = cursor.rows.iter().map(|m| m.user_id).collect();
+        assert_eq!(ids, vec![alice.id]);
+        assert!(cursor.next_after.is_none());
+    }
+
+    /// 复审 #2:迁移 0004 之后 user_roles 里还留着租户作用域角色(老账号的 admin / user)。
+    /// `UserRepo::list` 的 roles 列与 roles_any / roles_none 只看**平台**角色:租户角色不显示、按它筛选不命中。
+    pub(crate) async fn user_list_sees_platform_roles_only(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let bob = r.users.create("bob", None, "h", None).await.unwrap();
+        let sa = r
+            .roles
+            .upsert("sa", "平台管理员", RoleScope::Platform, None)
+            .await
+            .unwrap();
+        let ta = r
+            .roles
+            .upsert("ta", "租户角色", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        // 模拟迁移残留:租户角色也挂在 user_roles 上
+        r.roles.grant(alice.id, sa, None).await.unwrap();
+        r.roles.grant(alice.id, ta, None).await.unwrap();
+        r.roles.grant(bob.id, ta, None).await.unwrap();
+
+        async fn list(users: &dyn UserRepo, filter: UserListFilter) -> idm::UserListResult {
+            let page = ListPage::Offset {
+                offset: 0,
+                limit: 10,
+                with_total: true,
+            };
+            users
+                .list(&filter, UserSortBy::Username, SortDir::Asc, &page)
+                .await
+                .unwrap()
+        }
+
+        let all = list(&*r.users, UserListFilter::default()).await;
+        let roles_of = |name: &str| {
+            all.rows
+                .iter()
+                .find(|u| u.username == name)
+                .unwrap()
+                .roles
+                .clone()
+        };
+        assert_eq!(roles_of("alice"), vec!["sa".to_string()]);
+        assert!(roles_of("bob").is_empty());
+
+        // roles_any = 租户角色 → 谁都不命中
+        let any_ta = list(
+            &*r.users,
+            UserListFilter {
+                roles_any: vec!["ta".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(any_ta.rows.is_empty());
+        assert_eq!(any_ta.total, Some(0));
+        // roles_none = 租户角色 → 不排除任何人
+        let none_ta = list(
+            &*r.users,
+            UserListFilter {
+                roles_none: vec!["ta".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(none_ta.total, Some(2));
+        // 平台角色筛选照常
+        let any_sa = list(
+            &*r.users,
+            UserListFilter {
+                roles_any: vec!["sa".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let names: Vec<&str> = any_sa.rows.iter().map(|u| u.username.as_str()).collect();
+        assert_eq!(names, vec!["alice"]);
+    }
+
+    /// 复审 #3:`SessionRepo::revoke` 是条件更新,告诉调用方是否真撤掉了一行(refresh 轮换靠它防并发重放)。
+    pub(crate) async fn session_revoke_reports_whether_it_revoked(r: Repos) {
+        let alice = r.users.create("alice", None, "h", None).await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let s = r
+            .sessions
+            .create(alice.id, None, "h-revoke", now + Duration::days(1), None)
+            .await
+            .unwrap();
+        assert!(r.sessions.revoke(s.id).await.unwrap(), "首次撤销 → true");
+        assert!(
+            !r.sessions.revoke(s.id).await.unwrap(),
+            "已撤销再撤 → false(幂等,不报错)"
+        );
+        assert!(
+            !r.sessions.revoke(Uuid::now_v7()).await.unwrap(),
+            "不存在 → false"
+        );
+        assert!(r
+            .sessions
+            .find_active("h-revoke", now)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// 同一批用例生成内存入口(默认 cargo test)和 PG 入口(pg-conformance)。
     macro_rules! both_backends {
         ($($case:ident),* $(,)?) => {
@@ -1491,6 +1646,9 @@ mod idm_tenant_contract {
         create_with_membership_is_atomic,
         session_create_rejects_unknown_tenant,
         member_writes_on_deleted_tenant_are_not_found,
+        soft_deleted_user_not_addable_nor_listed_as_member,
+        user_list_sees_platform_roles_only,
+        session_revoke_reports_whether_it_revoked,
     );
 }
 
@@ -1696,6 +1854,215 @@ mod pg {
         assert_eq!(m1[0].roles, vec!["admin"]);
         let m2 = members.memberships_for_user(u2).await.unwrap();
         assert_eq!(m2[0].roles, vec!["admin", "user"]);
+        Ok(())
+    }
+
+    /// 复审 #3(并发):同一个 refresh token 被并发使用 N 次,只能有一次成功(其余 Unauthorized),
+    /// 且最终该用户只有一个活跃会话。修复前 find_active → revoke 非原子,会分出多个都有效的会话。
+    #[sqlx::test(migrations = false)]
+    async fn pg_concurrent_refresh_with_same_token_rotates_once(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use idm::{AuthService, FakeHasher, IdmError, RegisterInput};
+        use std::sync::Arc;
+
+        bootstrap_idm(&pool)
+            .await
+            .expect("bootstrap idm schema + 跑 migrations");
+        let svc = AuthService::builder(
+            Arc::new(idm::PgUserRepo::new(pool.clone())),
+            Arc::new(idm::PgSessionRepo::new(pool.clone())),
+            Arc::new(idm::PgRoleRepo::new(pool.clone())),
+            Arc::new(idm::PgMemberRepo::new(pool.clone())),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .signup_roles(Vec::new())
+        .build();
+        let reg = svc
+            .register(
+                RegisterInput {
+                    username: "alice".into(),
+                    email: None,
+                    password: "password123".into(),
+                },
+                None,
+            )
+            .await
+            .expect("register");
+
+        // 同时起 N 个任务:每个都先 find_active(都看到活跃会话)再撤销 —— 正是修复前的竞态窗口。
+        const N: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let svc = svc.clone();
+            let token = reg.refresh_token.clone();
+            let tenant = reg.tenant_id;
+            let user_id = reg.user.id;
+            handles.push(tokio::spawn(async move {
+                // 一半走 refresh、一半走 switch_tenant(切回同一个租户):两条路径共用同一把撤销闸
+                let res = match tenant {
+                    Some(t) if i % 2 == 1 => svc.switch_tenant(&token, user_id, t).await,
+                    _ => svc.refresh(&token).await,
+                };
+                res.map(|o| o.session_id)
+            }));
+        }
+        let mut ok = 0;
+        for h in handles {
+            match h.await.expect("task") {
+                Ok(_) => ok += 1,
+                Err(IdmError::Unauthorized) => {}
+                Err(e) => panic!("并发使用同一 refresh 只该得到 Unauthorized,得到 {e:?}"),
+            }
+        }
+        assert_eq!(ok, 1, "同一 refresh token 并发使用只能轮换出一个新会话");
+        let active: i64 = sqlx::query_scalar(
+            "select count(*) from sessions where user_id = $1 and revoked_at is null",
+        )
+        .bind(reg.user.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(active, 1, "最终只剩一个活跃会话");
+        Ok(())
+    }
+
+    /// 复审 #4:回滚 0004 不丢升级后授出的租户角色 —— 默认租户 **active 成员**的 member_roles 里**租户作用域**的行
+    /// 写回 user_roles(已有的不重复);平台角色、别的租户的角色不写回;表与列都被删掉。
+    /// 写回前先对账:user_roles 里租户作用域、但默认租户 active 成员的 member_roles 里没有的行删掉 ——
+    /// 升级后被撤权 / 停用 / 移出的人回滚后不复活。
+    #[sqlx::test(migrations = false)]
+    async fn migration_0004_down_restores_default_tenant_roles(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use super::Uuid;
+        use idm::{
+            MemberRepo, MemberStatus, RoleRepo, RoleScope, TenantRepo, UserRepo, DEFAULT_TENANT_ID,
+        };
+
+        bootstrap_idm(&pool)
+            .await
+            .expect("bootstrap idm schema + 跑 migrations");
+        let users = idm::PgUserRepo::new(pool.clone());
+        let roles = idm::PgRoleRepo::new(pool.clone());
+        let tenants = idm::PgTenantRepo::new(pool.clone());
+        let members = idm::PgMemberRepo::new(pool.clone());
+
+        let r_user = roles
+            .upsert("user", "成员", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let r_admin = roles
+            .upsert("admin", "管理员", RoleScope::Tenant, None)
+            .await
+            .unwrap();
+        let r_sa = roles
+            .upsert("superadmin", "平台管理员", RoleScope::Platform, None)
+            .await
+            .unwrap();
+        // 升级后注册的新账号:默认租户 user 角色,只在 member_roles 里
+        let newbie = users
+            .create_with_membership("newbie", None, "h", DEFAULT_TENANT_ID, &[r_user], None)
+            .await
+            .unwrap();
+        // 老账号:user_roles 已有 admin(迁移复制来的),默认租户里又被授了 user
+        let old = users.create("old", None, "h", None).await.unwrap();
+        roles.grant(old.id, r_admin, None).await.unwrap();
+        members
+            .add(DEFAULT_TENANT_ID, old.id, &[r_admin, r_user], None)
+            .await
+            .unwrap();
+        // 平台角色挂进 member_roles(写入只校验存在):不写回
+        let plat = users.create("plat", None, "h", None).await.unwrap();
+        members
+            .add(DEFAULT_TENANT_ID, plat.id, &[r_sa], None)
+            .await
+            .unwrap();
+        // 别的租户的角色:不写回
+        let acme = tenants.create("acme", "Acme", None).await.unwrap();
+        let other = users.create("other", None, "h", None).await.unwrap();
+        members
+            .add(acme.id, other.id, &[r_admin], None)
+            .await
+            .unwrap();
+
+        // 复审:先对账再写回 —— 升级后在默认租户里被撤权 / 停用 / 移出的人,回滚后不能靠 user_roles 里
+        // 迁移前遗留的租户角色行(或写回)复活。user_roles 里的租户角色行模拟 0004 之前的授予(up 只复制不搬)。
+        // 撤权:老账号原有 admin(user_roles 遗留),升级后在默认租户被撤成只剩 user → 回滚后只有 user
+        let demoted = users.create("demoted", None, "h", None).await.unwrap();
+        roles.grant(demoted.id, r_admin, None).await.unwrap();
+        roles.grant(demoted.id, r_sa, None).await.unwrap(); // 平台角色:不受对账影响
+        members
+            .add(DEFAULT_TENANT_ID, demoted.id, &[r_admin], None)
+            .await
+            .unwrap();
+        members
+            .set_roles(DEFAULT_TENANT_ID, demoted.id, &[r_user], None)
+            .await
+            .unwrap();
+        // 停用:关系与角色保留,但 status = inactive → 不写回,遗留的 admin 也删掉
+        let paused = users.create("paused", None, "h", None).await.unwrap();
+        roles.grant(paused.id, r_admin, None).await.unwrap();
+        members
+            .add(DEFAULT_TENANT_ID, paused.id, &[r_admin, r_user], None)
+            .await
+            .unwrap();
+        members
+            .set_status(DEFAULT_TENANT_ID, paused.id, MemberStatus::Inactive, None)
+            .await
+            .unwrap();
+        // 移出:成员行连同 member_roles 删掉 → 遗留的 admin 也删掉
+        let gone = users.create("gone", None, "h", None).await.unwrap();
+        roles.grant(gone.id, r_admin, None).await.unwrap();
+        members
+            .add(DEFAULT_TENANT_ID, gone.id, &[r_admin], None)
+            .await
+            .unwrap();
+        members
+            .remove(DEFAULT_TENANT_ID, gone.id, None)
+            .await
+            .unwrap();
+
+        IDM_MIGRATOR.undo(&pool, 3).await.expect("回滚 0004");
+
+        let ur: Vec<(Uuid, Uuid)> =
+            sqlx::query_as("select user_id, role_id from user_roles order by user_id, role_id")
+                .fetch_all(&pool)
+                .await?;
+        let mut expect = vec![
+            (newbie.id, r_user),
+            (old.id, r_admin),
+            (old.id, r_user),
+            (demoted.id, r_user),
+            (demoted.id, r_sa),
+        ];
+        expect.sort();
+        assert_eq!(
+            ur, expect,
+            "撤权的只剩现有角色、停用 / 移出的租户角色不复活、平台角色不动"
+        );
+
+        // 0004 建的表 / 列都没了
+        let left: i64 = sqlx::query_scalar(
+            "select count(*) from information_schema.tables \
+             where table_schema = current_schema() \
+               and table_name in ('tenants', 'tenant_members', 'member_roles')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(left, 0);
+        let cols: i64 = sqlx::query_scalar(
+            "select count(*) from information_schema.columns \
+             where table_schema = current_schema() \
+               and ((table_name = 'roles' and column_name = 'scope') \
+                 or (table_name = 'sessions' and column_name = 'tenant_id'))",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(cols, 0);
+
+        // 再升回去照常(down 之后 up 可重放)
+        IDM_MIGRATOR.run(&pool).await.expect("重新跑 0004");
         Ok(())
     }
 

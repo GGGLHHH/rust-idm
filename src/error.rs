@@ -3,6 +3,8 @@
 //!
 //! 防枚举:`login` 返回携带原因的 `InvalidCredentials`(`CredentialFailure::UnknownUser` /
 //! `BadPassword`),原因**仅供审计**;HTTP 收口由消费方 app 统一返 401,原因绝不进响应体。
+//! 改密 / 注销的密码确认错同样是 `InvalidCredentials(BadPassword)`(凭据错,会话仍有效),
+//! 与会话失效的 `Unauthorized` 分开 —— 消费方据此给两个不同的机器码。
 //!
 //! `Internal` 的原始 source chain 不在这里记日志(无 HTTP 层),由 app 的错误响应处统一落日志。
 
@@ -25,7 +27,7 @@ pub enum IdmError {
     #[error("authentication failed")]
     Unauthorized,
 
-    /// 登录凭据无效,携带失败原因**供审计**。消费方**必须**仍统一返 401(防枚举),
+    /// 凭据无效(登录 / 改密旧密码 / 注销密码确认),携带失败原因**供审计**。消费方**必须**仍统一返 401(防枚举),
     /// 原因只进审计事件、绝不进响应体。
     #[error("invalid credentials")]
     InvalidCredentials(CredentialFailure),

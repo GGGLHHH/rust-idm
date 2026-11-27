@@ -260,12 +260,14 @@ impl AuthService {
     }
 
     /// 刷新:验 refresh hash → 轮换(撤旧 session、发新会话)。无效/过期/已撤销 → `Unauthorized`。
+    /// 同一 refresh token 并发使用:撤销是条件更新,只有撤到行的那一个继续签发,其余 `Unauthorized`。
     /// **沿用会话上的租户**,重新读成员关系和租户角色;成员被移出 / 停用、租户停用 / 删除 → `Unauthorized`
     /// (旧会话照样作废,绝不悄悄落到别的租户)。平台上下文的会话刷新后仍是平台上下文。
     pub async fn refresh(&self, refresh_token: &str) -> Result<AuthOutcome, IdmError> {
         let session = self.active_session(refresh_token).await?;
         // 轮换:旧 refresh 一次性,撤销后发新会话(防 refresh 重放)。先撤:后面任何一步失败旧会话都已作废。
-        self.inner.sessions.revoke(session.id).await?;
+        // 撤到 0 行 = 已被并发的另一次 refresh / 切换用掉 → Unauthorized,绝不再分出第二个会话。
+        self.consume_session(session.id).await?;
         let user = self.inner.users.find_by_id(session.user_id).await?;
         let tenant = match session.tenant_id {
             None => None,
@@ -280,7 +282,7 @@ impl AuthService {
 
     /// 切换当前租户:凭 refresh token 认会话 → 校验在目标租户是**有效成员**(成员 active + 租户 active)
     /// → 吊销旧会话 → 建带新租户的会话 → 记 `last_used_at`(下次登录默认进它)。
-    /// refresh 无效 → `Unauthorized`;不是有效成员(含平台管理员切进自己不是成员的租户)→ `Forbidden`,
+    /// refresh 无效(含已被并发的 refresh / 切换用掉)→ `Unauthorized`;不是有效成员(含平台管理员切进自己不是成员的租户)→ `Forbidden`,
     /// 原会话不动。
     ///
     /// `user_id` = 调用方已认证的当前身份(消费方从 access token 取)。refresh 会话不属于他 → `Unauthorized`,
@@ -305,7 +307,8 @@ impl AuthService {
             Err(IdmError::NotFound) => return Err(IdmError::Forbidden),
             other => other?,
         }
-        self.inner.sessions.revoke(session.id).await?;
+        // 撤销是轮换闸(同 refresh):撤到 0 行 = 这个 refresh 已被并发用掉 → Unauthorized,不签新会话。
+        self.consume_session(session.id).await?;
         self.issue_session(&user, Some(&membership), None).await
     }
 
@@ -314,7 +317,8 @@ impl AuthService {
         self.inner.members.memberships_for_user(user_id).await
     }
 
-    /// 登出:撤销该 refresh 对应的会话,返回被撤会话(含 `user_id`,审计用)。幂等(找不到活跃会话 → `None`)。
+    /// 登出:撤销该 refresh 对应的会话,返回被撤会话(含 `user_id`,审计用)。幂等(找不到活跃会话,
+    /// 或被并发的登出 / 刷新抢先撤掉 → `None`)。
     pub async fn logout(&self, refresh_token: &str) -> Result<Option<Session>, IdmError> {
         let hash = token::hash_refresh(refresh_token);
         if let Some(session) = self
@@ -323,8 +327,9 @@ impl AuthService {
             .find_active(&hash, self.inner.clock.now())
             .await?
         {
-            self.inner.sessions.revoke(session.id).await?;
-            return Ok(Some(session));
+            if self.inner.sessions.revoke(session.id).await? {
+                return Ok(Some(session));
+            }
         }
         Ok(None)
     }
@@ -353,7 +358,8 @@ impl AuthService {
         Ok(to_view(&user, roles))
     }
 
-    /// 注销(DELETE /me):验密 → 撤销所有会话 → 软删账户。密码错 → `Unauthorized`。`by` = 审计主体。
+    /// 注销(DELETE /me):验密 → 撤销所有会话 → 软删账户。`by` = 审计主体。
+    /// 密码错 → `InvalidCredentials(BadPassword)`(凭据错,会话仍有效);账号已不在 → `Unauthorized`(会话失效)。
     pub async fn delete_me(
         &self,
         user_id: Uuid,
@@ -367,13 +373,14 @@ impl AuthService {
             .await?
             .ok_or(IdmError::Unauthorized)?;
         if !self.verify_password(password, hash).await? {
-            return Err(IdmError::Unauthorized);
+            return Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword));
         }
         self.inner.sessions.revoke_all(user_id, None).await?;
         self.inner.users.soft_delete(user_id, by).await
     }
 
-    /// 改密(POST /me/password):验旧密码 → 换 hash → 撤销所有会话(强制重登录)。旧密码错 → `Unauthorized`。
+    /// 改密(POST /me/password):验旧密码 → 换 hash → 撤销所有会话(强制重登录)。
+    /// 旧密码错 → `InvalidCredentials(BadPassword)`(凭据错,会话仍有效);账号已不在 → `Unauthorized`(会话失效)。
     pub async fn change_password(
         &self,
         user_id: Uuid,
@@ -386,12 +393,21 @@ impl AuthService {
             .await?
             .ok_or(IdmError::Unauthorized)?;
         if !self.verify_password(input.current_password, hash).await? {
-            return Err(IdmError::Unauthorized);
+            return Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword));
         }
         let new_hash = self.hash_password(input.new_password).await?;
         self.inner.users.update_password(user_id, &new_hash).await?;
         self.inner.sessions.revoke_all(user_id, None).await?;
         Ok(())
+    }
+
+    /// 一次性用掉 refresh 会话(轮换闸):真撤掉了 → `Ok`;已被别人撤掉(并发重放)→ `Unauthorized`。
+    async fn consume_session(&self, session_id: Uuid) -> Result<(), IdmError> {
+        if self.inner.sessions.revoke(session_id).await? {
+            Ok(())
+        } else {
+            Err(IdmError::Unauthorized)
+        }
     }
 
     /// 按 refresh token 找活跃会话;无效 / 过期 / 已撤销 → `Unauthorized`。
@@ -728,6 +744,52 @@ mod tests {
         );
     }
 
+    /// 改密 / 注销的密码确认错 = 凭据错(`InvalidCredentials(BadPassword)`),不是 `Unauthorized`:
+    /// 消费方据此把「密码不对」和「会话失效」分成两个机器码,前端才不会把输错密码当成会话过期。
+    #[tokio::test]
+    async fn wrong_password_on_change_password_and_delete_me_is_invalid_credentials() {
+        use crate::error::CredentialFailure;
+        use crate::input::ChangePasswordInput;
+
+        let svc = AuthService::builder(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemoryMemberRepo::new()),
+        )
+        .hs256_secret("secret")
+        .hasher(Arc::new(FakeHasher))
+        .signup_roles(Vec::new())
+        .build();
+        let alice = svc.register(register_input("alice"), None).await.unwrap();
+
+        let changed = svc
+            .change_password(
+                alice.user.id,
+                ChangePasswordInput {
+                    current_password: "wrong".into(),
+                    new_password: "newpass456".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                changed,
+                Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))
+            ),
+            "改密旧密码错应为 InvalidCredentials(BadPassword): {changed:?}"
+        );
+
+        let deleted = svc.delete_me(alice.user.id, "wrong".into(), None).await;
+        assert!(
+            matches!(
+                deleted,
+                Err(IdmError::InvalidCredentials(CredentialFailure::BadPassword))
+            ),
+            "注销密码错应为 InvalidCredentials(BadPassword): {deleted:?}"
+        );
+    }
+
     #[tokio::test]
     async fn login_reports_distinct_failure_reasons() {
         use crate::error::CredentialFailure;
@@ -828,6 +890,132 @@ mod tests {
         assert!(svc.logout(&reg.refresh_token).await.unwrap().is_none());
     }
     // ── 多租户:登录选租户 / 切换 / refresh 沿用租户 / 注册加入默认租户 ──
+    /// 模拟并发窗口:`find_active` 返回的是"别人撤销之前"读到的快照 —— 两个请求都先查到活跃会话、再去撤。
+    /// 撤销闸(条件更新)得让后到的那个撤到 0 行 → `Unauthorized`,不再签第二个会话。
+    struct StaleReadSessions {
+        inner: InMemorySessionRepo,
+        seen: Mutex<std::collections::HashMap<String, crate::repo::Session>>,
+        stale_hits: std::sync::atomic::AtomicUsize,
+        created: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::repo::SessionRepo for StaleReadSessions {
+        async fn create(
+            &self,
+            user_id: Uuid,
+            tenant_id: Option<Uuid>,
+            token_hash: &str,
+            expires_at: OffsetDateTime,
+            by: Option<String>,
+        ) -> Result<crate::repo::Session, IdmError> {
+            self.created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .create(user_id, tenant_id, token_hash, expires_at, by)
+                .await
+        }
+        async fn find_active(
+            &self,
+            token_hash: &str,
+            now: OffsetDateTime,
+        ) -> Result<Option<crate::repo::Session>, IdmError> {
+            if let Some(s) = self.inner.find_active(token_hash, now).await? {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .insert(token_hash.to_owned(), s.clone());
+                return Ok(Some(s));
+            }
+            let stale = self.seen.lock().unwrap().get(token_hash).cloned();
+            if stale.is_some() {
+                self.stale_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(stale)
+        }
+        async fn revoke(&self, session_id: Uuid) -> Result<bool, IdmError> {
+            self.inner.revoke(session_id).await
+        }
+        async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError> {
+            self.inner.revoke_all(user_id, except).await
+        }
+        async fn revoke_for_member(&self, tenant_id: Uuid, user_id: Uuid) -> Result<(), IdmError> {
+            self.inner.revoke_for_member(tenant_id, user_id).await
+        }
+        async fn revoke_for_tenant(&self, tenant_id: Uuid) -> Result<(), IdmError> {
+            self.inner.revoke_for_tenant(tenant_id).await
+        }
+    }
+
+    /// 复审 #3:同一个 refresh token 第二次使用(refresh 或 switch_tenant)→ `Unauthorized`。
+    /// 顺序重放(普通仓储)和并发窗口(find_active 读到撤销前的快照)两种都要挡住。
+    #[tokio::test]
+    async fn reused_refresh_token_cannot_rotate_twice() {
+        use std::sync::atomic::Ordering;
+
+        // ① 顺序重放
+        let e = env();
+        let alice = e.account("alice").await;
+        e.members
+            .add(DEFAULT_TENANT_ID, alice, &[], None)
+            .await
+            .unwrap();
+        let first = e.login("alice").await;
+        e.svc.refresh(&first.refresh_token).await.unwrap();
+        assert!(matches!(
+            e.svc.refresh(&first.refresh_token).await,
+            Err(IdmError::Unauthorized)
+        ));
+        assert!(matches!(
+            e.svc
+                .switch_tenant(&first.refresh_token, alice, DEFAULT_TENANT_ID)
+                .await,
+            Err(IdmError::Unauthorized)
+        ));
+
+        // ② 并发窗口:find_active 仍"看到"已被轮换掉的会话
+        let users = InMemoryUserRepo::new();
+        let sessions = Arc::new(StaleReadSessions {
+            inner: InMemorySessionRepo::sharing_with(&users),
+            seen: Mutex::default(),
+            stale_hits: Default::default(),
+            created: Default::default(),
+        });
+        let roles = Arc::new(InMemoryRoleRepo::sharing_with(&users));
+        let members = Arc::new(InMemoryMemberRepo::sharing_with(&users));
+        let svc = AuthService::builder(Arc::new(users), sessions.clone(), roles, members)
+            .hs256_secret("secret")
+            .hasher(Arc::new(FakeHasher))
+            .signup_roles(Vec::new())
+            .build();
+        let reg = svc.register(register_input("bob"), None).await.unwrap();
+        assert_eq!(reg.tenant_id, Some(DEFAULT_TENANT_ID));
+        svc.refresh(&reg.refresh_token).await.unwrap();
+        assert_eq!(sessions.created.load(Ordering::SeqCst), 2);
+
+        assert!(matches!(
+            svc.refresh(&reg.refresh_token).await,
+            Err(IdmError::Unauthorized)
+        ));
+        assert!(matches!(
+            svc.switch_tenant(&reg.refresh_token, reg.user.id, DEFAULT_TENANT_ID)
+                .await,
+            Err(IdmError::Unauthorized)
+        ));
+        assert_eq!(
+            sessions.stale_hits.load(Ordering::SeqCst),
+            2,
+            "两次重放都确实走进了并发窗口(find_active 读到旧快照)"
+        );
+        assert_eq!(
+            sessions.created.load(Ordering::SeqCst),
+            2,
+            "重放没有分出新会话"
+        );
+        // 被并发抢先撤掉的会话登出 → None(没撤到就不报告撤了)
+        assert!(svc.logout(&reg.refresh_token).await.unwrap().is_none());
+    }
 
     use crate::input::LoginInput;
     use crate::repo::{InMemoryTenantRepo, MemberRepo, RoleRepo, TenantRepo, UserRepo};

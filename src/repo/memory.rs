@@ -2,7 +2,7 @@
 //! 镜像 PG 的软删过滤、username 唯一、email(有则)唯一,保 parity。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -459,12 +459,18 @@ impl UserRepo for InMemoryUserRepo {
         let store = self.store.lock().expect("锁未中毒");
         let grants = self.roles.grants.lock().expect("锁未中毒");
         let roles = self.roles.roles.lock().expect("锁未中毒");
-        // 某用户的存活角色名(按名排序,parity with PG 子查询 ORDER BY r.name)。
+        // 某用户的存活**平台**角色名(按名排序,parity with PG 子查询 ORDER BY r.name)。
+        // user_roles 里的租户作用域行(迁移 0004 复制残留)不算,镜像 PG 的 scope = 'platform' 过滤。
         let role_names = |uid: Uuid| -> Vec<String> {
             let mut ns: Vec<String> = grants
                 .iter()
                 .filter(|(u, _)| *u == uid)
-                .filter_map(|(_, rid)| roles.iter().find(|r| r.id == *rid).map(|r| r.name.clone()))
+                .filter_map(|(_, rid)| {
+                    roles
+                        .iter()
+                        .find(|r| r.id == *rid && r.scope == RoleScope::Platform)
+                        .map(|r| r.name.clone())
+                })
                 .collect();
             ns.sort();
             ns
@@ -646,12 +652,19 @@ impl SessionRepo for InMemorySessionRepo {
             }))
     }
 
-    async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError> {
+    async fn revoke(&self, session_id: Uuid) -> Result<bool, IdmError> {
+        // 查 + 改在同一把锁里:镜像 PG 的条件更新,并发撤同一会话只有一个拿到 true。
         let mut store = self.store.lock().expect("锁未中毒");
-        if let Some(r) = store.iter_mut().find(|r| r.id == session_id) {
-            r.revoked_at.get_or_insert(OffsetDateTime::now_utc());
+        match store
+            .iter_mut()
+            .find(|r| r.id == session_id && r.revoked_at.is_none())
+        {
+            Some(r) => {
+                r.revoked_at = Some(OffsetDateTime::now_utc());
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(())
     }
 
     async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError> {
@@ -1151,7 +1164,14 @@ impl MemberRepo for InMemoryMemberRepo {
     ) -> Result<Membership, IdmError> {
         // 先校验(各自短暂持锁,避免与 UserRepo::list 的锁序交叉),后改状态。
         self.check_roles_exist(role_ids)?;
-        if !self.users.lock().expect("锁未中毒").contains_key(&user_id) {
+        // 用户须存活:已软删的账号同"不存在"(镜像 PG 的 deleted_at is null 检查)。
+        let user_alive = self
+            .users
+            .lock()
+            .expect("锁未中毒")
+            .get(&user_id)
+            .is_some_and(|u| u.deleted_at.is_none());
+        if !user_alive {
             return Err(IdmError::NotFound);
         }
         let mut members = self.tenants.members.lock().expect("锁未中毒");
@@ -1262,6 +1282,15 @@ impl MemberRepo for InMemoryMemberRepo {
         tenant_id: Uuid,
         page: &ListPage,
     ) -> Result<ListResult<Membership>, IdmError> {
+        // 存活账号快照:先短暂持用户锁再放掉,不和成员 / 租户锁嵌套(建号路径是 用户锁 → 租户锁)。
+        let alive_users: HashSet<Uuid> = self
+            .users
+            .lock()
+            .expect("锁未中毒")
+            .values()
+            .filter(|u| u.deleted_at.is_none())
+            .map(|u| u.id)
+            .collect();
         let members = self.tenants.members.lock().expect("锁未中毒");
         let tenants = self.tenants.tenants.lock().expect("锁未中毒");
         let rows = match tenants
@@ -1269,9 +1298,10 @@ impl MemberRepo for InMemoryMemberRepo {
             .find(|t| t.id == tenant_id && t.deleted_at.is_none())
         {
             Some(t) => {
+                // 已软删账号不进成员列表 / total(镜像 PG 的 users.deleted_at is null 条件)
                 let mut rows: Vec<Membership> = members
                     .iter()
-                    .filter(|m| m.tenant_id == tenant_id)
+                    .filter(|m| m.tenant_id == tenant_id && alive_users.contains(&m.user_id))
                     .map(|m| self.to_membership(t, m))
                     .collect();
                 rows.sort_by_key(|m| m.user_id);
