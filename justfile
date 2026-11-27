@@ -26,19 +26,26 @@ test-pg:
 # 全量:内存 + PG
 test-all: test test-pg
 
-# lint:格式检查 + clippy(警告即失败)
+# lint:格式检查(稳定版 + nightly 的 Google 风格三项)+ clippy(警告即失败)
 lint:
     cargo fmt --all -- --check
+    cargo +nightly fmt --all -- --check --config {{google_fmt}}
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # 自动格式化
 fmt:
     cargo fmt --all
+    cargo +nightly fmt --all -- --config {{google_fmt}}
+
+# Google Rust 风格指南要求、但只有 nightly rustfmt 支持的三项(稳定版只有 rustfmt.toml 里的 max_width)。
+# 改这里要同步 .github/workflows/ci.yml 的 nightly fmt 步骤。
+google_fmt := "imports_granularity=Module,hex_literal_case=Lower,format_macro_matchers=true"
 
 # 自动修复:clippy 机器可应用的建议自动改 + 格式化
 fix:
     cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features
     cargo fmt --all
+    cargo +nightly fmt --all -- --config {{google_fmt}}
 
 # 清理本 crate 的编译产物与增量缓存(保留依赖缓存)
 clean:

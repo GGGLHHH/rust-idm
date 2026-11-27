@@ -9,7 +9,8 @@
 //! `Internal` 的原始 source chain 不在这里记日志(无 HTTP 层),由 app 的错误响应处统一落日志。
 
 /// 登录凭据失败的具体原因。**仅供审计**——HTTP 层仍统一 401(防枚举由消费方 app 收口)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CredentialFailure {
     /// identifier 查无存活用户。
     UnknownUser,
@@ -17,18 +18,21 @@ pub enum CredentialFailure {
     BadPassword,
 }
 
+/// idm 的领域错误。不能 `Copy`:`Conflict` 带消息字符串、`Internal` 带 `anyhow::Error`。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+#[must_use]
 pub enum IdmError {
     /// 资源不存在 / 已软删。
     #[error("resource not found")]
     NotFound,
 
-    /// 未认证 / 凭据无效。**绝不区分"用户不存在"与"密码错误"**(防枚举)。
+    /// 未认证 / 会话无效。**绝不区分"用户不存在"与"密码错误"**(防枚举)。
     #[error("authentication failed")]
     Unauthorized,
 
-    /// 凭据无效(登录 / 改密旧密码 / 注销密码确认),携带失败原因**供审计**。消费方**必须**仍统一返 401(防枚举),
-    /// 原因只进审计事件、绝不进响应体。
+    /// 凭据无效(登录 / 改密旧密码 / 注销密码确认),携带失败原因**供审计**。消费方**必须**仍统一返 401
+    /// (防枚举),原因只进审计事件、绝不进响应体。
     #[error("invalid credentials")]
     InvalidCredentials(CredentialFailure),
 
@@ -36,11 +40,13 @@ pub enum IdmError {
     #[error("forbidden")]
     Forbidden,
 
-    /// 资源冲突(用户名/邮箱已占用)。消息写给用户、可回传。
+    /// 资源冲突(用户名 / 邮箱已占用)。消息写给用户、可回传。
     #[error("conflict: {0}")]
     Conflict(String),
 
     /// 兜底:任何 anyhow 错误(DB / IO / 依赖)。原始细节交 app 落日志、绝不进响应体。
+    // 带模块名写 `anyhow::Error`:`Error` 是常见名,指南「Type names should be imported and used
+    // unqualified」的歧义例外。
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

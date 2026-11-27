@@ -2,7 +2,7 @@
 # 被 app 当 lib 依赖(app 在自己的 features/auth 建 HTTP 边界);也能独立做 repo 一致性测试。迁移表见 migrations/。
 [package]
 name = "idm"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained auth / IDM domain & service library: AuthService + pluggable repos + its own IdmError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and cookies."
@@ -12,7 +12,8 @@ keywords = ["auth", "idm", "jwt", "authentication", "argon2"]
 categories = ["authentication"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# 库里只用 spawn_blocking(argon2 哈希挪出 worker 线程),只要 rt;测试用的 macros / time 见 [dev-dependencies]。
+tokio = { version = "1", features = ["rt"] }
 
 # serde:JWT Claims 编解码 + outbox payload(serde_json::Value)用(无 HTTP / DTO 序列化)。
 serde = { version = "1", features = ["derive"] }
@@ -29,14 +30,19 @@ sea-query = "1.0"
 sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time", "with-json"] }
 async-trait = "0.1"
 
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-time = { version = "0.3", features = ["serde-well-known"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+# serde:outbox payload 里带时间戳(`json!` 序列化 OffsetDateTime)。
+time = { version = "0.3", features = ["serde"] }
 base64 = "0.22"
 
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = "0.5"
 jsonwebtoken = "9"
 sha2 = "0.10"
 rand = "0.8"
+
+[dev-dependencies]
+# #[tokio::test] 要 macros;auth_service 的单元测试用 tokio::time::sleep。
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [features]
 # 同 app:pg-conformance 开了才编译打真库的仓储一致性测试。
@@ -44,6 +50,23 @@ pg-conformance = []
 
 [lints.rust]
 unsafe_code = "forbid"
+# 公开 API 都要有文档(Google Rust 风格指南:When and how to write documentation)。
+missing_docs = "warn"
 
 [lints.clippy]
 all = "warn"
+# Google Rust 风格指南(https://google.github.io/styleguide/rustguide.html)里能交给 clippy 守的条目。
+# 阈值配置在 clippy.toml;unwrap_used 只对产品代码开(lib.rs 的 #![warn]),测试里的 panic 就是断言。
+# 类型、trait 导入后不带路径用;跨模块的函数用「模块名::函数名」调用(超过两段的路径 → 改成 use)。
+absolute_paths = "warn"
+# 纯函数 / 返回值不能丢的函数加 #[must_use]。
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+# 会 panic 的公开函数在文档里写 # Panics。
+missing_panics_doc = "warn"
+# .clone() 不能代替借用。
+redundant_clone = "warn"
+# 对外公开的枚举 / 带公开字段的结构体加 #[non_exhaustive](指南 Apply #[non_exhaustive] 两条);
+# 落在条款例外里的用 #[allow(..., reason = "…")] 写明依据。
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
